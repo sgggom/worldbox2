@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>Wordbox</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <button id="settingsToggle" class="ghost-button" type="button">设置</button>
+        <div class="topbar-spacer" aria-hidden="true"></div>
+        <button id="debugToggle" class="ghost-button" type="button" hidden>调试</button>
+      </header>
+
+      <section class="story-panel">
+        <main class="chat-stage">
+          <section id="messageList" class="message-list" aria-live="polite"></section>
+        </main>
+
+        <section id="choiceTray" class="choice-tray" hidden>
+          <button
+            id="choiceToggle"
+            class="choice-toggle"
+            type="button"
+            aria-expanded="false"
+            aria-controls="choiceBar"
+            aria-label="展开选项"
+          >
+            <span id="choiceToggleLabel" class="choice-toggle-label">选项</span>
+          </button>
+          <section id="choiceBar" class="choice-bar" hidden></section>
+        </section>
+
+        <form id="composer" class="composer">
+          <label class="composer-field" for="playerInput">
+            <textarea
+              id="playerInput"
+              rows="1"
+              placeholder="输入对白、行动或你的想法"
+              maxlength="600"
+            ></textarea>
+          </label>
+          <button id="sendButton" type="submit" aria-label="发送">
+            <span class="send-button-glyph" aria-hidden="true">➤</span>
+          </button>
+        </form>
+
+        <p id="statusText" class="status-inline">先配置模型，然后开始一段新的故事。</p>
+      </section>
+    </div>
+
+    <div id="scrim" class="scrim" hidden></div>
+
+    <aside id="settingsDrawer" class="drawer" hidden>
+      <div class="drawer-header">
+        <h2>模型配置</h2>
+        <button id="closeSettings" class="ghost-button" type="button">关闭</button>
+      </div>
+
+      <div class="drawer-body">
+        <section class="settings-story-card">
+          <div class="settings-story-meta">
+            <p class="settings-kicker">当前故事</p>
+            <h3 id="storyTitle">Wordbox</h3>
+            <p id="storyObjective" class="settings-story-objective">多 Agent 互动叙事</p>
+          </div>
+          <button id="themeToggle" class="ghost-button theme-toggle" type="button">夜间模式</button>
+        </section>
+
+        <label class="field">
+          <span>服务预设</span>
+          <select id="providerPreset"></select>
+        </label>
+
+        <label class="field">
+          <span>Base URL</span>
+          <input id="baseUrl" type="url" placeholder="https://api.openai.com/v1">
+        </label>
+
+        <label class="field">
+          <span>API Key</span>
+          <input id="apiKey" type="password" placeholder="sk-...">
+        </label>
+
+        <label class="field">
+          <span>模型</span>
+          <input id="model" type="text" placeholder="gpt-4.1-mini">
+        </label>
+
+        <div class="field-grid">
+          <label class="field">
+            <span>Temperature</span>
+            <input id="temperature" type="number" min="0" max="2" step="0.1">
+          </label>
+
+          <label class="field">
+            <span>上下文预算</span>
+            <input id="maxContextBudget" type="number" min="2000" max="64000" step="500">
+          </label>
+        </div>
+
+        <label class="field">
+          <span>打字速度</span>
+          <select id="typingSpeed">
+            <option value="10">很快</option>
+            <option value="14">较快</option>
+            <option value="18">标准</option>
+            <option value="24">舒缓</option>
+            <option value="32">缓慢</option>
+          </select>
+          <small id="typingSpeedHint" class="field-hint">标准速度</small>
+        </label>
+
+        <div class="drawer-actions">
+          <button id="saveConfigButton" class="primary-button" type="button">保存配置</button>
+          <button id="newGameButton" class="secondary-button" type="button">新游戏</button>
+          <button id="clearSaveButton" class="ghost-button danger-button" type="button">清空存档</button>
+        </div>
+
+        <section class="hint-card">
+          <h3>运行说明</h3>
+          <p>默认使用离线 Mock Story，可先验证流程。切换到真实服务后，所有 agent 共用同一个模型配置。</p>
+        </section>
+      </div>
+    </aside>
+
+    <aside id="debugDrawer" class="drawer drawer-debug" hidden>
+      <div class="drawer-header">
+        <h2>调试视图</h2>
+        <button id="closeDebug" class="ghost-button" type="button">关闭</button>
+      </div>
+
+      <div class="drawer-body debug-body">
+        <section class="debug-card">
+          <h3>状态概览</h3>
+          <pre id="debugState"></pre>
+        </section>
+
+        <section class="debug-card">
+          <h3>Agent 记忆</h3>
+          <pre id="debugMemories"></pre>
+        </section>
+
+        <section class="debug-card">
+          <h3>最近流水</h3>
+          <pre id="debugPipeline"></pre>
+        </section>
+      </div>
+    </aside>
+
+    <template id="messageTemplate">
+      <article class="message">
+        <p class="message-speaker"></p>
+        <div class="message-bubble">
+          <p class="message-text"></p>
+        </div>
+      </article>
+    </template>
+
+    <script>
+      const script = document.createElement("script");
+      if (window.location.protocol === "file:") {
+        script.src = "./app.bundle.js";
+      } else {
+        script.type = "module";
+        script.src = "./app.js";
+      }
+      document.body.append(script);
+    </script>
+  </body>
+</html>

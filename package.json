@@ -1,0 +1,10 @@
+{
+  "scripts": {
+    "bundle": "node build-bundle.mjs",
+    "start": "python3 -m http.server 8000",
+    "test:smoke": "node smoke-test.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.58.2"
+  }
+}
