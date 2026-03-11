@@ -6,13 +6,6 @@ const DEFAULT_TYPING_SPEED = 18;
 
 const PROVIDER_PRESETS = [
   {
-    id: "mock",
-    label: "Mock Story (离线演示)",
-    baseUrl: "mock://story",
-    model: "wordbox-sim",
-    requiresKey: false,
-  },
-  {
     id: "openai",
     label: "OpenAI",
     baseUrl: "https://api.openai.com/v1",
@@ -63,12 +56,13 @@ function createEmptyMemory(agentId) {
 }
 
 function createDefaultAppState() {
+  const defaultPreset = PROVIDER_MAP.get("openai");
   return {
     providerConfig: {
-      providerPreset: "mock",
-      baseUrl: PROVIDER_MAP.get("mock").baseUrl,
+      providerPreset: "openai",
+      baseUrl: defaultPreset.baseUrl,
       apiKey: "",
-      model: PROVIDER_MAP.get("mock").model,
+      model: defaultPreset.model,
       temperature: 0.9,
       maxContextBudget: 12000,
       stream: false,
@@ -111,8 +105,11 @@ function createDefaultAppState() {
         premise: "",
         summary: "",
         currentBeat: "",
+        currentNodeId: "",
+        nodes: [],
         milestones: [],
         activeThreads: [],
+        resolvedThreads: [],
         dangerLevel: "低",
         sceneCounter: 0,
       },
@@ -144,12 +141,25 @@ function getProviderPreset(presetId) {
 }
 
 function normalizeProviderConfig(config) {
-  const preset = getProviderPreset(config.providerPreset);
+  const rawPresetId = typeof config?.providerPreset === "string" ? config.providerPreset.trim() : "";
+  const rawBaseUrl = typeof config?.baseUrl === "string" ? config.baseUrl.trim() : "";
+  const rawModel = typeof config?.model === "string" ? config.model.trim() : "";
+  const isLegacyMockConfig =
+    rawPresetId === "mock" || rawBaseUrl.startsWith("mock://") || rawModel === "wordbox-sim";
+  const normalizedPresetId = PROVIDER_MAP.has(rawPresetId)
+    ? rawPresetId
+    : isLegacyMockConfig
+    ? "openai"
+    : rawBaseUrl || rawModel
+    ? "custom"
+    : "openai";
+  const preset = getProviderPreset(normalizedPresetId);
+
   return {
-    providerPreset: config.providerPreset || "mock",
-    baseUrl: config.baseUrl || preset.baseUrl,
+    providerPreset: normalizedPresetId,
+    baseUrl: isLegacyMockConfig ? preset.baseUrl : rawBaseUrl || preset.baseUrl,
     apiKey: config.apiKey || "",
-    model: config.model || preset.model,
+    model: isLegacyMockConfig ? preset.model : rawModel || preset.model,
     temperature: Number.isFinite(Number(config.temperature))
       ? Number(config.temperature)
       : 0.9,
@@ -332,8 +342,6 @@ function pushCandidate(candidates, value) {
 function normalizeJsonLikeText(value) {
   return String(value || "")
     .replace(/^\uFEFF/, "")
-    .replace(/[“”]/g, '"')
-    .replace(/[‘’]/g, "'")
     .trim();
 }
 
@@ -343,6 +351,8 @@ function repairJsonLikeText(value) {
   }
 
   return value
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
     .replace(/([{,]\s*)([A-Za-z_\u4e00-\u9fa5][\w\u4e00-\u9fa5-]*)(\s*:)/g, '$1"$2"$3')
     .replace(/'/g, '"')
     .replace(/，/g, ",")
@@ -518,12 +528,20 @@ function normalizeChoices(choices = []) {
   return choices
     .filter(Boolean)
     .slice(0, 4)
-    .map((choice, index) => ({
-      id: choice.id || `choice-${index + 1}`,
-      label: choice.label || choice.title || choice.text || `选项 ${index + 1}`,
-      intent: choice.intent || "",
-      payload: choice.payload || choice.label || choice.text || "",
-    }));
+    .map((choice, index) => {
+      const label = choice.label || choice.title || choice.text || "";
+      if (!label) {
+        return null;
+      }
+
+      return {
+        id: choice.id || `choice-${index + 1}`,
+        label,
+        intent: choice.intent || "",
+        payload: choice.payload || label,
+      };
+    })
+    .filter(Boolean);
 }
 
 function createTurnRecord(summary, payload) {
@@ -574,9 +592,38 @@ function updateCanon(memory, summary) {
   memory.canonSummary = summary.slice(0, 1600);
 }
 
-function baseMessages(rolePrompt, userPrompt) {
+function buildMemoryContext(memory) {
+  if (!memory) {
+    return "";
+  }
+
+  const recentTurns = Array.isArray(memory.recentTurns)
+    ? memory.recentTurns
+        .map((item, index) => {
+          const summary = typeof item?.summary === "string" ? item.summary.trim() : "";
+          return summary ? `${index + 1}. ${summary}` : "";
+        })
+        .filter(Boolean)
+        .join("\n")
+    : "";
+
   return [
-    { role: "system", content: rolePrompt },
+    memory.canonSummary ? `既定事实：\n${memory.canonSummary}` : "",
+    memory.chapterSummary ? `章节压缩：\n${memory.chapterSummary}` : "",
+    recentTurns ? `最近回合记忆：\n${recentTurns}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function baseMessages(rolePrompt, userPrompt, memory) {
+  const memoryContext = buildMemoryContext(memory);
+  const systemContent = memoryContext
+    ? `${rolePrompt}\n\n以下是你自己的内部记忆，只能用于保持连续性，不要原样复述给玩家：\n${memoryContext}`
+    : rolePrompt;
+
+  return [
+    { role: "system", content: systemContent },
     { role: "user", content: userPrompt },
   ];
 }
@@ -588,20 +635,12 @@ async function callStructuredAgent({
   rolePrompt,
   userPrompt,
   requestOptions,
-  mock,
 }) {
-  if (config.providerPreset === "mock") {
-    const payload = await mock();
-    remember(memory, payload.summary || `${agentId} completed`, payload);
-    compressIfNeeded(memory, config.maxContextBudget);
-    return payload;
-  }
-
   const resolvedOptions = requestOptions || getRequestOptionsForAgent(agentId);
   try {
     const raw = await callOpenAiCompatible(
       config,
-      baseMessages(rolePrompt, userPrompt),
+      baseMessages(rolePrompt, userPrompt, memory),
       resolvedOptions
     );
     const payload = await parseStructuredPayloadWithRepair({
@@ -616,17 +655,6 @@ async function callStructuredAgent({
     compressIfNeeded(memory, config.maxContextBudget);
     return payload;
   } catch (error) {
-    if (shouldUseLocalStructuredFallback(error, mock)) {
-      const fallbackPayload = await mock();
-      fallbackPayload.__fallbackMeta = {
-        agentId,
-        source: "mock",
-        reason: error.message,
-      };
-      remember(memory, fallbackPayload.summary || `${agentId} completed`, fallbackPayload);
-      compressIfNeeded(memory, config.maxContextBudget);
-      return fallbackPayload;
-    }
     throw new Error(`${agentId} 失败：${error.message}`);
   }
 }
@@ -706,10 +734,6 @@ function extractJsonContract(prompt) {
   return text.slice(-2600);
 }
 
-function shouldUseLocalStructuredFallback(error, mock) {
-  return typeof mock === "function" && error?.code === "STRUCTURED_OUTPUT_INVALID";
-}
-
 function collectSetupAnswers(storyState) {
   const pairs = SETUP_FIELDS.map((field) => {
     const value = storyState.setup.answers[field.key];
@@ -743,284 +767,6 @@ function buildSetupDigest(storyState) {
     `整体氛围是 ${answers.tone || "待补全"}。`,
     `内容边界：${answers.boundaries || "未特别限制"}。`,
   ].join(" ");
-}
-
-function createDeterministicSeed(...parts) {
-  const text = parts.filter(Boolean).join("|") || "seed";
-  let hash = 0;
-  for (const char of text) {
-    hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
-  }
-  return hash;
-}
-
-function rotateTake(list, count, seed) {
-  if (!Array.isArray(list) || !list.length) {
-    return [];
-  }
-
-  const start = ((seed % list.length) + list.length) % list.length;
-  const picked = [];
-  for (let index = 0; index < Math.min(count, list.length); index += 1) {
-    picked.push(list[((start + index) % list.length + list.length) % list.length]);
-  }
-  return picked;
-}
-
-function pickDeterministic(list, seed, offset = 0) {
-  if (!Array.isArray(list) || !list.length) {
-    return "";
-  }
-  return list[(Math.abs(seed) + offset) % list.length];
-}
-
-function inferWorldFlavor(storyState) {
-  const world = storyState.setup.answers.world || "";
-  const genre = storyState.setup.answers.genre || "";
-  const text = `${world} ${genre}`;
-
-  if (/(宫|后宫|朝堂|王朝|妃|皇|帝|女官)/.test(text)) {
-    return "court";
-  }
-  if (/(赛博|都市|公司|集团|近未来|街区)/.test(text)) {
-    return "urban";
-  }
-  if (/(仙|宗门|奇幻|灵|妖|修真)/.test(text)) {
-    return "fantasy";
-  }
-  return "general";
-}
-
-function buildDynamicSetupQuestion(field, storyState) {
-  const answers = storyState.setup.answers;
-  const seed = createDeterministicSeed(
-    "setup-question",
-    field.key,
-    storyState.storyId,
-    storyState.setup.turnCount,
-    JSON.stringify(answers)
-  );
-
-  switch (field.key) {
-    case "world": {
-      const openings = [
-        "先别套现成模板，直接说你脑海里第一个浮出来的舞台。",
-        "我们先抓世界底色，不预设类型，你心里最有画面的舞台是什么？",
-        "开局先定世界，不按固定题库走。你想把故事扔进怎样的时代和秩序里？",
-        "先把世界感定住。你更想看到怎样的时代气味、权力结构和生存压力？",
-      ];
-      const focus = [
-        "它更像一座礼法森严却处处藏针的宫城，还是某种高压运转的陌生秩序？",
-        "你可以从时代、权力中心、社会规则，或者最想看到的生活质感切进去。",
-        "不用拘泥于标签，你只要告诉我这个世界最先扑到脸上的那种空气感。",
-        "如果玩家一睁眼就站进这个世界，你最想让他先感受到什么秩序和压迫？",
-      ];
-      return `${pickDeterministic(openings, seed)}${pickDeterministic(focus, seed, 1)}`;
-    }
-    case "genre": {
-      const openings = [
-        "舞台定下来之后，我们抓主线冲突。",
-        "有了世界以后，接下来该定它最锋利的矛盾。",
-        "世界底色已经有轮廓了，现在说说你最想玩的戏核。",
-      ];
-      const focus = [
-        `在这个${answers.world || "世界"}里，你更想让故事围着哪种冲突转？`,
-        `放进${answers.world || "这个舞台"}以后，什么样的主线最能勾住你？`,
-        `如果把${answers.world || "这个世界"}真正推起来，你希望核心张力落在哪一类对抗上？`,
-      ];
-      return `${pickDeterministic(openings, seed)}${pickDeterministic(focus, seed, 1)}`;
-    }
-    case "protagonist": {
-      const openings = [
-        "接下来定你从哪里入局。",
-        "主线有了，现在选主角切口。",
-        "轮到确定玩家身份了。",
-      ];
-      const focus = [
-        `在这个${answers.world || "世界"}里，你想以什么身份卷进${answers.genre || "这条主线"}？`,
-        `面对${answers.genre || "这类冲突"}，你更想站在什么位置、带着什么起手处境进场？`,
-        `如果故事从你第一步落地开始，你更想让主角是局中人、边缘人，还是被迫拖下水的人？`,
-      ];
-      return `${pickDeterministic(openings, seed)}${pickDeterministic(focus, seed, 2)}`;
-    }
-    case "tone": {
-      const openings = [
-        "最后把整体气质拧紧。",
-        "再定一下这部互动小说的情绪和速度。",
-        "现在只差整体氛围了。",
-      ];
-      const focus = [
-        `如果把这段${answers.genre || "故事"}真正写出来，你更想要它呈现什么气质和节奏？`,
-        `落到行文里，你希望它更压抑、锋利、华丽，还是慢慢逼近的悬疑感？`,
-        `从阅读体感来说，你更想让它像贴着呼吸推进，还是像钝刀慢慢压下来？`,
-      ];
-      return `${pickDeterministic(openings, seed)}${pickDeterministic(focus, seed, 1)}`;
-    }
-    case "boundaries": {
-      const openings = [
-        "最后补一下边界。",
-        "收尾前，把不想碰的内容也定掉。",
-        "还差一项安全线设置。",
-      ];
-      const focus = [
-        "有没有你明确不想出现的内容、强度、关系走向或描写方式？",
-        "哪些桥段你希望避开，或者至少别写得太重？",
-        "如果有禁区，现在说清楚，后面就按这个边界跑。",
-      ];
-      return `${pickDeterministic(openings, seed)}${pickDeterministic(focus, seed, 2)}`;
-    }
-    default:
-      return `继续补全「${field.label}」的信息。`;
-  }
-}
-
-function buildDynamicSetupChoices(field, storyState) {
-  const seed = createDeterministicSeed(
-    field.key,
-    storyState.storyId,
-    storyState.setup.turnCount,
-    JSON.stringify(storyState.setup.answers)
-  );
-  const flavor = inferWorldFlavor(storyState);
-  let candidates = [];
-
-  if (field.key === "world") {
-    const eras = [
-      "礼法森严的深宫王朝",
-      "繁华与猜忌并生的旧都",
-      "霓虹失真的近未来城邦",
-      "财阀盘踞的高压都市",
-      "灵脉将断的修真宗门地界",
-      "神权与皇权撕扯的祭祀王庭",
-      "海贸改写秩序的群岛联邦",
-      "蒸汽与铁律并行的工业帝国",
-    ];
-    const powerStructures = [
-      "朝堂、后宫与家族势力互相咬合",
-      "监察机关与商会共同编织日常秩序",
-      "旧贵族、军权与地下消息网彼此牵制",
-      "宗门戒律、世俗王权与民间力量三方失衡",
-      "神殿、皇室和地方豪强同时争夺解释权",
-      "公司、安保系统与黑市渠道一起分食权力",
-    ];
-    const pressures = [
-      "表面华丽，暗处每一步都像踩在针尖上",
-      "规则看似完整，实际人人都靠试探活着",
-      "秩序没有崩，但裂缝已经多到能吞人",
-      "人人都在守规矩，人人也都准备破规矩",
-      "表面安静，底层却像被慢火一直煨着",
-      "空气里总像压着一件随时会爆开的旧事",
-    ];
-
-    const eraSlice = rotateTake(eras, 4, seed);
-    const powerSlice = rotateTake(powerStructures, 4, seed >> 1);
-    const pressureSlice = rotateTake(pressures, 4, seed >> 2);
-    candidates = eraSlice.map((label, index) => ({
-      label,
-      intent: `${powerSlice[index % powerSlice.length]}，${pressureSlice[index % pressureSlice.length]}`,
-    }));
-  }
-
-  if (field.key === "genre") {
-    const frontPoolsByFlavor = {
-      court: ["后宫暗流", "内廷与朝堂", "被压下的宫闱旧案", "失势者的复起局", "家族与凤位之争"],
-      urban: ["公司高层黑幕", "城市边缘秘案", "权力机构内斗", "被清理过的旧记录", "上层交易链"],
-      fantasy: ["宗门权位更替", "被封禁的术法真相", "仙门与王权边界", "师门旧债", "灵脉衰竭后的乱局"],
-      general: ["权力漩涡中心", "被压下的真相", "多方试探的密局", "失势后的反制局", "一件牵出旧账的异常"],
-    };
-    const enginePoolsByFlavor = {
-      court: ["争宠借势", "权谋试探", "借刀破局", "查案翻线", "暗中结盟"],
-      urban: ["调查追查", "潜伏反制", "交换筹码", "顺线摸底", "借势翻盘"],
-      fantasy: ["破禁追源", "宗门试探", "旧债清算", "势力结盟", "禁术反噬"],
-      general: ["追线破局", "权力反制", "慢慢翻盘", "互探底牌", "借势上位"],
-    };
-    const pressurePoolsByFlavor = {
-      court: ["每一步都要押对人心", "局势越静越危险", "一句失言都可能反噬", "温柔表面下全是针"],
-      urban: ["越靠近真相越容易被灭口", "规则写在纸上，刀落在暗处", "每层关系都带着代价", "监控之外才是真正的战场"],
-      fantasy: ["越碰真相越会触动禁忌", "恩义和戒律随时会反咬", "所有平静都像在给风暴蓄势", "灵力与人心一样不可靠"],
-      general: ["每前进一步都要付代价", "局中人没有一个真的干净", "看似平静的局面随时会翻面", "越接近答案越难全身而退"],
-    };
-    const fronts = rotateTake(frontPoolsByFlavor[flavor], 4, seed);
-    const engines = rotateTake(enginePoolsByFlavor[flavor], 4, seed >> 1);
-    const pressures = rotateTake(pressurePoolsByFlavor[flavor], 4, seed >> 2);
-    candidates = fronts.map((front, index) => ({
-      label: `${front}里的${engines[index % engines.length]}`,
-      intent: `${pressures[index % pressures.length]}，主线会围着${front}持续推进`,
-    }));
-  }
-
-  if (field.key === "protagonist") {
-    const rolePoolsByFlavor = {
-      court: ["新入局的妃嫔", "表面失势的皇后", "掌簿女官", "外来谋士", "奉命入局的医女"],
-      urban: ["被当成弃子的调查员", "刚升进核心层的秘书", "握着线人的中间人", "误入漩涡的集团新人", "替上层背锅的执行者"],
-      fantasy: ["刚入内门的弟子", "被贬回山的旧传人", "掌秘库的执事", "背债入局的散修", "奉命下山的司录使"],
-      general: ["被推到风口的新人", "表面失势却还握着筹码的人", "知道一角内幕的执行者", "不想站队的旁观者", "被临时拖下水的局外人"],
-    };
-    const positionPoolsByFlavor = {
-      court: ["却被提前盯上", "手里压着一段旧账", "看似无宠却被暗中需要", "背后没有靠山", "刚好站在最危险的位置"],
-      urban: ["刚好撞见不该看到的东西", "名义上有职权、实则没有退路", "表面干净却背着旧记录", "被几方同时试探", "离真相只差半步"],
-      fantasy: ["一脚踩进禁令边缘", "身上带着宗门旧债", "表面不起眼却碰过关键秘辛", "被各峰同时盯上", "与某段失传旧事有牵连"],
-      general: ["却被局势提前卷入", "手里握着一点别人没有的东西", "站得不高却看得太多", "背着不能明说的前账", "刚进局就被推到前台"],
-    };
-    const motives = [
-      "从这个切口开局，关系和筹码会更快咬合起来",
-      "这个身份方便被各方拉拢、试探或利用",
-      "这个位置天生适合卷进秘密和反转",
-      "这个起点会让后续选择更疼，也更有戏",
-      "从这里入局，人物弧光会比较强",
-    ];
-    const roles = rotateTake(rolePoolsByFlavor[flavor], 4, seed);
-    const positions = rotateTake(positionPoolsByFlavor[flavor], 4, seed >> 1);
-    const motiveSlice = rotateTake(motives, 4, seed >> 2);
-    candidates = roles.map((role, index) => ({
-      label: `${role}，${positions[index % positions.length]}`,
-      intent: motiveSlice[index % motiveSlice.length],
-    }));
-  }
-
-  if (field.key === "tone") {
-    const moods = ["压抑紧绷", "华丽危险", "冷静克制", "高压黑暗", "锋利机巧", "暧昧悬疑", "沉静而带后劲"];
-    const rhythms = ["慢刀试探", "步步逼近", "节奏偏快", "留白里带压迫", "每一拍都像试探底线", "表面平静、底下很急"];
-    const textures = [
-      "环境压迫感更强",
-      "对白要带刺",
-      "更强调心理波动和停顿",
-      "细节要像贴着呼吸往前推",
-      "更适合写试探和失衡",
-      "整体读起来要有冷意和后劲",
-    ];
-    const moodSlice = rotateTake(moods, 4, seed);
-    const rhythmSlice = rotateTake(rhythms, 4, seed >> 1);
-    const textureSlice = rotateTake(textures, 4, seed >> 2);
-    candidates = moodSlice.map((mood, index) => ({
-      label: `${mood}，${rhythmSlice[index % rhythmSlice.length]}`,
-      intent: `${textureSlice[index % textureSlice.length]}，更像一部真正的互动小说`,
-    }));
-  }
-
-  if (field.key === "boundaries") {
-    const softenVerbs = ["尽量淡化", "不要重写", "避免核心推进依赖", "可以少量带到，但别铺开"];
-    const topicA = ["直白血腥", "酷刑羞辱", "纯恋爱主导", "过重惊悚", "极端压迫关系", "太晦涩的设定解释"];
-    const topicB = ["身体折磨", "羞辱惩罚", "单纯撒糖式推进", "恐怖氛围", "关系失衡的压迫感", "大段设定讲解"];
-    const flexibleModes = [
-      { label: "可以自由发挥，不额外设限", intent: "先按主线张力优先推进" },
-      { label: "保留锋利感，但不要故意堆重口", intent: "允许冲突，但别为了刺激感牺牲故事" },
-    ];
-    const verbSlice = rotateTake(softenVerbs, 3, seed);
-    const topicSliceA = rotateTake(topicA, 3, seed >> 1);
-    const topicSliceB = rotateTake(topicB, 3, seed >> 2);
-    candidates = verbSlice.map((verb, index) => ({
-      label: `${verb}${topicSliceA[index % topicSliceA.length]}和${topicSliceB[index % topicSliceB.length]}描写`,
-      intent: "把这条边界写进后续生成约束",
-    }));
-    candidates.push(flexibleModes[seed % flexibleModes.length]);
-  }
-
-  return normalizeChoices(candidates);
-}
-
-function buildFallbackSetupAck(playerInput) {
-  return playerInput ? "我记下来了，继续把剩余关键信息补齐。" : "先把故事底色定下来。";
 }
 
 function rememberLocalAgentResult(memory, config, agentId, payload) {
@@ -1073,19 +819,80 @@ function buildPlanDigest(plan) {
   ].join("\n");
 }
 
+function truncateInlineText(value, limit = 180) {
+  const text = typeof value === "string" ? value.trim().replace(/\s+/g, " ") : "";
+  if (!text) {
+    return "";
+  }
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
+function normalizePlotNodes(nodes = []) {
+  return (Array.isArray(nodes) ? nodes : [])
+    .filter(Boolean)
+    .map((node, index) => ({
+      id: node.id || `node-${index + 1}`,
+      title: node.title || `节点 ${index + 1}`,
+      summary: truncateInlineText(node.summary || node.goal || "", 120),
+      goal: truncateInlineText(node.goal || node.summary || "", 90),
+      status: node.status || (index === 0 ? "active" : "planned"),
+    }));
+}
+
+function buildWorldStateDigest(worldState) {
+  return [
+    `世界摘要：${worldState.summary || "暂无"}`,
+    `地点：${(worldState.locations || []).slice(0, 4).join(" / ") || "暂无"}`,
+    `势力：${(worldState.activeForces || []).slice(0, 4).join(" / ") || "暂无"}`,
+    `近期事件：${(worldState.recentEvents || []).slice(-4).join(" / ") || "暂无"}`,
+  ].join("\n");
+}
+
+function buildPlotStateDigest(plotState, currentObjective = "") {
+  const nodes = normalizePlotNodes(plotState.nodes);
+  const nodeLines = nodes.length
+    ? nodes
+        .map((node) => {
+          const marker = node.id === plotState.currentNodeId ? ">" : "-";
+          return `${marker} ${node.id} | ${node.title} | status=${node.status} | ${node.summary || node.goal || "暂无摘要"}`;
+        })
+        .join("\n")
+    : "暂无节点";
+
+  return [
+    `主线摘要：${plotState.summary || "暂无"}`,
+    `当前目标：${currentObjective || "暂无"}`,
+    `当前拍点：${plotState.currentBeat || "暂无"}`,
+    `当前节点：${plotState.currentNodeId || "未定"}`,
+    `活跃悬念：${(plotState.activeThreads || []).join(" / ") || "暂无"}`,
+    `已解决悬念：${(plotState.resolvedThreads || []).join(" / ") || "暂无"}`,
+    `节点骨架：\n${nodeLines}`,
+  ].join("\n");
+}
+
+function buildTranscriptDigest(snapshot, limit = 8) {
+  const transcript = Array.isArray(snapshot.chatTranscript) ? snapshot.chatTranscript : [];
+  const visible = transcript.slice(-limit);
+  if (!visible.length) {
+    return "暂无";
+  }
+
+  return visible
+    .map((message) => {
+      const speaker =
+        message.type === "player"
+          ? "玩家"
+          : message.speakerName || (message.type === "npc" ? "角色" : "系统旁白");
+      return `[${speaker}] ${truncateInlineText(message.text, 180)}`;
+    })
+    .join("\n");
+}
+
 function runLocalFormatAgent(memory, config, agentId, draft, summary) {
   const messages = parseDraftMessages(draft);
   const payload = {
     summary: summary || "格式整理完成。",
-    messages: messages.length
-      ? messages
-      : [
-          {
-            type: "system",
-            speakerName: "系统旁白",
-            text: String(draft || "场景继续推进。").trim() || "场景继续推进。",
-          },
-        ],
+    messages,
   };
   rememberLocalAgentResult(memory, config, agentId, payload);
   return payload;
@@ -1108,6 +915,14 @@ function parseDraftMessages(draft) {
 
       const speaker = line.slice(0, delimiterIndex).trim();
       const text = line.slice(delimiterIndex + 1).trim();
+      const looksLikeSpeaker = /^(系统旁白|旁白|系统|[\u4e00-\u9fa5A-Za-z0-9·]{1,16})$/.test(speaker);
+      if (!looksLikeSpeaker) {
+        return {
+          type: "system",
+          speakerName: "系统旁白",
+          text: line,
+        };
+      }
       const isSystem = /^(系统旁白|旁白|系统)$/.test(speaker);
       return {
         type: isSystem ? "system" : "npc",
@@ -1122,8 +937,8 @@ function getRequestOptionsForAgent(agentId) {
     "plot.setup": { maxTokens: 520, timeoutMs: 60000 },
     "world.bootstrap": { maxTokens: 520, timeoutMs: 70000 },
     "character.bootstrap": { maxTokens: 900, timeoutMs: 90000 },
-    "plot.bootstrap": { maxTokens: 1500, timeoutMs: 100000 },
-    "plot.turn": { maxTokens: 1850, timeoutMs: 105000 },
+    "plot.bootstrap": { maxTokens: 1800, timeoutMs: 100000 },
+    "plot.turn": { maxTokens: 2200, timeoutMs: 115000 },
     "world.turn": { maxTokens: 420, timeoutMs: 60000 },
     "character.turn": { maxTokens: 760, timeoutMs: 75000 },
   };
@@ -1168,21 +983,31 @@ ${playerInput || "无，准备开启第一问"}
 ${targetField.guidance}`;
 }
 
-function plotSetupMock(snapshot, playerInput, targetField) {
-  return {
-    summary: `建档继续收集 ${targetField.label}`,
-    field: targetField.key,
-    ack: buildFallbackSetupAck(playerInput),
-    question: {
-      speakerName: "格式 agent",
-      text: buildDynamicSetupQuestion(targetField, snapshot.storyState),
-    },
-    choices: buildDynamicSetupChoices(targetField, snapshot.storyState),
-  };
+function getSetupQuestionText(setupResult) {
+  const value =
+    typeof setupResult?.question === "string"
+      ? setupResult.question.trim()
+      : typeof setupResult?.question?.text === "string"
+      ? setupResult.question.text.trim()
+      : "";
+
+  if (!value) {
+    throw new Error("plot.setup 未返回可展示的问题文本。");
+  }
+
+  return value;
+}
+
+function getRequiredDraftText(rawDraft, agentId) {
+  const draft = typeof rawDraft === "string" ? rawDraft.trim() : "";
+  if (!draft) {
+    throw new Error(`${agentId} 未返回可展示的正文。`);
+  }
+  return draft;
 }
 
 function buildWorldPrompt(snapshot, setupDigest) {
-  return `你是世界控制 agent。请根据玩家偏好和剧情摘要生成一个紧凑的世界设定包。
+  return `你是世界控制 agent。你只负责隐藏状态，不负责剧情正文。请根据玩家偏好和剧情摘要生成一个紧凑的世界设定包。
 
 偏好摘要：
 ${setupDigest}
@@ -1200,33 +1025,18 @@ ${setupDigest}
 1. 内容适合长线互动叙事。
 2. 控制在关键内容，不要流水账。
 3. 与玩家偏好一致。
-4. 不要输出 markdown 代码块，不要解释，只返回 JSON。`;
-}
-
-function worldMock(snapshot, setupDigest) {
-  const world = snapshot.storyState.setup.answers.world || "现代都市";
-  const tone = snapshot.storyState.setup.answers.tone || "紧张压迫";
-  return {
-    summary: `${world}背景下，一座表面安静、暗潮汹涌的城市即将把主角卷入失控事件。整体氛围偏${tone}。`,
-    rules: [
-      "每次重大行动都会留下可追踪后果。",
-      "信息并不完整，关键真相需要逐层挖掘。",
-      "人物关系会因为玩家态度发生偏移。",
-    ],
-    locations: ["旧城区档案馆", "河岸轻轨站", "夜间营业的茶室"],
-    activeForces: ["沉默的地方势力", "隐藏在公共机构中的观察者", "一支立场不明的小团体"],
-    recentEvents: ["三天前发生了一起被压下的离奇事件。", "有人开始追查一份失踪的记录。"],
-  };
+4. 这是隐藏状态，不要写对白、旁白或玩家可见文案。
+5. 不要输出 markdown 代码块，不要解释，只返回 JSON。`;
 }
 
 function buildCharacterPrompt(snapshot) {
-  return `你是角色控制 agent。请基于以下信息建立玩家与 NPC 的初始角色结构。
+  return `你是角色控制 agent。你只负责隐藏状态，不负责剧情正文。请基于以下信息建立玩家与 NPC 的初始角色结构。
 
 偏好摘要：
 ${collectSetupAnswers(snapshot.storyState)}
 
-世界摘要：
-${snapshot.storyState.worldState.summary}
+世界状态：
+${buildWorldStateDigest(snapshot.storyState.worldState)}
 
 只输出 JSON：
 {
@@ -1261,75 +1071,18 @@ ${snapshot.storyState.worldState.summary}
 2. NPC 要有不同功能和冲突点。
 3. 玩家身份要能自然进入主线。
 4. 玩家和 NPC 都必须有稳定的外貌描述与初始装扮记录。
-5. 不要输出 markdown 代码块，不要解释，只返回 JSON。`;
-}
-
-function characterMock(snapshot) {
-  const protagonist = snapshot.storyState.setup.answers.protagonist || "普通人卷入事件";
-  return {
-    summary: `玩家作为${protagonist}进入事件核心，外貌与装束已经明确，身边围绕着一位线索提供者、一位立场不明的盟友和一位潜在对手。`,
-    playerProfile: {
-      role: protagonist,
-      drive: "想弄清事件真相，同时保护自己在意的人。",
-      secret: "过去似乎与这起事件有隐约关联。",
-      appearance: "眉眼沉静，神色克制，像总在先看清局势再开口的人。",
-      outfit: "一身便于夜行的素色常服，外罩轻薄披风，袖口收得利落。",
-      outfitHistory: ["开局时穿着素色常服与轻薄披风。"],
-    },
-    npcs: [
-      {
-        id: "npc-yao",
-        name: "姚汀",
-        role: "递来第一条线索的人",
-        goal: "逼主角尽快行动",
-        tone: "冷静、直接",
-        status: "谨慎观察中",
-        trust: 1,
-        appearance: "身形清瘦，眼神锐利，脸上几乎没有多余表情。",
-        outfit: "深灰短外套配利落长裤，衣料低调但剪裁干净。",
-        outfitHistory: ["初次登场时穿着深灰短外套与利落长裤。"],
-      },
-      {
-        id: "npc-lin",
-        name: "林折",
-        role: "掌握城市边缘情报的灰色中间人",
-        goal: "在风险和利益之间保持平衡",
-        tone: "轻佻、会试探",
-        status: "半合作状态",
-        trust: 0,
-        appearance: "笑意总挂在嘴角，发丝微乱，像从不把自己彻底交给规矩。",
-        outfit: "暗纹衬衫外松垮长风衣，袖口和领口都带一点刻意的散漫。",
-        outfitHistory: ["初次登场时是暗纹衬衫配松垮长风衣。"],
-      },
-      {
-        id: "npc-zhou",
-        name: "周霁",
-        role: "看似站在秩序一侧的关键人物",
-        goal: "维持局面，隐藏更深的真相",
-        tone: "克制、压迫感强",
-        status: "尚未完全表态",
-        trust: -1,
-        appearance: "面容端正冷峻，站姿笔直，目光像一把始终未出鞘的刀。",
-        outfit: "深色制式外套一丝不苟，肩线锋利，连袖扣都没有偏差。",
-        outfitHistory: ["初次登场时穿着一丝不苟的深色制式外套。"],
-      },
-    ],
-    relationships: [
-      "姚汀相信玩家有能力，但不完全信任动机。",
-      "林折把玩家视为值得下注的新变量。",
-      "周霁知道更多真相，正在评估玩家是否危险。",
-    ],
-  };
+5. 这是隐藏状态，不要写对白、旁白或玩家可见文案。
+6. 不要输出 markdown 代码块，不要解释，只返回 JSON。`;
 }
 
 function buildPlotBlueprintPrompt(snapshot) {
-  return `你是剧情控制 agent。现在建档已完成，请根据世界和角色信息生成主线结构。
+  return `你是剧情控制 agent。现在建档已完成，你将作为整段故事唯一的可见写作者。请根据世界和角色信息生成主线结构，并写出开场正文。
 
-世界摘要：
-${snapshot.storyState.worldState.summary}
+世界状态：
+${buildWorldStateDigest(snapshot.storyState.worldState)}
 
-角色摘要：
-${snapshot.storyState.characterState.summary || ""}
+角色状态：
+${buildCharacterUpdateDigest(snapshot.storyState.characterState)}
 
 只输出 JSON：
 {
@@ -1337,69 +1090,50 @@ ${snapshot.storyState.characterState.summary || ""}
   "title": "故事标题",
   "premise": "故事开局 premise",
   "currentBeat": "开场剧情节点",
+  "currentNodeId": "当前主线节点 id",
+  "storyNodes": [
+    {
+      "id": "node-1",
+      "title": "节点标题",
+      "summary": "这一节点会发生什么",
+      "goal": "这一节点想把玩家推向哪里",
+      "status": "active/planned/locked/completed"
+    }
+  ],
   "milestones": ["关键节点"],
   "activeThreads": ["当前悬而未决的问题"],
   "openingObjective": "玩家现在最先要做什么",
-  "openingDraft": "开场剧情草稿，偏小说化的多行文本；每行都必须是「系统旁白：...」或「角色名：...」",
+  "openingDraft": "开场正文。允许自然分段叙事；旁白段落直接写 prose，对话行才使用「角色名：台词」",
   "openingChoices": [{"label":"...", "intent":"...", "payload":"..."}],
   "openingInputHint": "输入提示"
 }
 
 要求：
 1. 不要输出 markdown 代码块，不要解释，只返回 JSON。
-2. summary、milestones 这些结构字段保持紧凑，但 openingDraft 必须有互动小说的叙事感，要写出环境、动作、情绪或压迫感。
-3. openingDraft 写 4 到 7 行，每行都要以「系统旁白：」或「角色名：」开头；每行可以是一小段完整叙述或对白，允许 1 到 3 句。
-4. openingChoices 提供 2 到 4 个。`;
-}
-
-function plotBlueprintMock(snapshot) {
-  const genre = snapshot.storyState.setup.answers.genre || "悬疑推进";
-  const guideName = snapshot.storyState.characterState.npcs[0]?.name || "陌生人";
-  return {
-    summary: `一场被压下的异常事件正在扩大，玩家必须在不同势力之间选择合作与怀疑，逐步揭开城市暗面的真相。`,
-    title: `${genre}之城`,
-    premise: "一份消失的记录把玩家推向三股彼此防备的力量中心。",
-    currentBeat: "引子：陌生人发来会面的坐标。",
-    milestones: [
-      "确认第一条线索的真伪",
-      "识别真正操盘的一方",
-      "在公开崩坏前做出立场选择",
-    ],
-    activeThreads: ["是谁删掉了那份记录？", "姚汀为什么选中玩家？", "周霁到底在保护什么？"],
-    openingObjective: "赶去约定地点，与姚汀接头并判断她是否可信。",
-    openingDraft: [
-      "系统旁白：夜色把城市压成一整片潮湿的铁灰色。你刚从便利店屋檐下躲开一阵细雨，手机便在掌心里轻轻震了一下，亮起的屏幕上只有一条没有署名的消息。",
-      "系统旁白：消息里没有寒暄，没有解释，只有一处河岸轻轨站的定位，以及一句像命令又像警告的话: 别迟到。短短三个字，却像有人隔着屏幕已经看清了你此刻的迟疑。",
-      "系统旁白：你盯着那行字看了几秒，雨水顺着广告牌的边缘往下淌，落在鞋尖前，碎成一片昏黄霓虹。你很清楚，三天前那份凭空消失的记录不会自己回来，而眼下这条消息，多半就是裂缝第一次真正朝你张开。",
-      `${guideName}：如果你真的想知道三天前发生了什么，就现在来河岸轻轨站。别带太多人，也别把信任带来。`,
-      "系统旁白：风从高架桥下穿过去，带着一点锈味和河水腥气。你把手机收进口袋时，忽然意识到自己已经在往前迈步了，像是从看见那条消息开始，故事就不再允许你站在原地。",
-    ].join("\n"),
-    openingChoices: normalizeChoices([
-      { label: "立刻赶去轻轨站", intent: "主动推进剧情", payload: "我马上过去。" },
-      { label: "先追问她的身份", intent: "试探 NPC", payload: "你到底是谁？" },
-      { label: "绕路去档案馆摸底", intent: "谨慎调查", payload: "在赴约前，我想先查档案馆。" },
-    ]),
-    openingInputHint: "输入你的对白、试探或行动",
-  };
+2. 你是唯一负责可见正文文风的人，行文必须稳定、连贯、有文学感。
+3. summary、storyNodes、milestones 保持紧凑，但 openingDraft 必须有互动小说的叙事感，要写出环境、动作、情绪和压迫感。
+4. openingDraft 写 4 到 6 段；叙述段落不要硬加「系统旁白：」，只有人物开口时才用「角色名：台词」。
+5. 开场要明确落在某个 storyNodes 上，并让 currentNodeId 对应 active 节点。
+6. openingChoices 提供 2 到 4 个。`;
 }
 
 function buildPlotTurnPrompt(snapshot, playerInput) {
-  return `你是剧情控制 agent。请在本回合完成剧情审查、推进规划，并直接写出本回合剧情草稿。
+  return `你是剧情控制 agent。你是整段故事唯一的可见写作者。请在本回合完成剧情审查、推进规划，并直接写出本回合正文。
 
 玩家输入：
 ${playerInput}
 
-当前主线：
-${snapshot.storyState.plotState.summary}
+当前故事骨架：
+${buildPlotStateDigest(snapshot.storyState.plotState, snapshot.storyState.currentObjective)}
 
-当前目标：
-${snapshot.storyState.currentObjective}
+世界状态：
+${buildWorldStateDigest(snapshot.storyState.worldState)}
 
-世界摘要：
-${snapshot.storyState.worldState.summary}
+角色状态：
+${buildCharacterUpdateDigest(snapshot.storyState.characterState)}
 
-角色摘要：
-${snapshot.storyState.characterState.summary || ""}
+最近可见剧情：
+${buildTranscriptDigest(snapshot, 8)}
 
 请只输出 JSON：
 {
@@ -1432,127 +1166,23 @@ ${snapshot.storyState.characterState.summary || ""}
   "stateUpdates": {
     "currentObjective": "新的当前目标",
     "activeThreads": ["新的悬念"],
+    "resolvedThreads": ["本回合得到阶段性解决的问题"],
     "dangerLevel": "低/中/高"
   },
-  "draft": "本回合剧情草稿，偏小说化的多行文本；每行都必须是「系统旁白：...」或「角色名：...」"
+  "plotProgress": {
+    "currentNodeId": "当前主线节点 id",
+    "nodeStatusUpdates": [{"id":"node-1","status":"completed"}]
+  },
+  "draft": "本回合正文。允许自然分段叙事；旁白段落直接写 prose，对话行才使用「角色名：台词」"
 }
 
 要求补充：
 1. draft 由你直接写作，再交给格式 agent 拆成玩家可见消息。
-2. draft 要写出互动小说感，不要只给简报句。
-3. draft 写 4 到 7 行，每行都要以「系统旁白：」或「角色名：」开头；每行可以是一小段完整叙述或对白，允许 1 到 3 句。
-4. choiceBlueprints 和 inputHint 继续输出，用于主 agent 推进下一步。`;
-}
-
-function plotTurnMock(snapshot, playerInput) {
-  const input = (playerInput || "").trim();
-  const sceneCounter = (snapshot.storyState.plotState.sceneCounter || 0) + 1;
-  const mentionsInquiry = /(查|问|调查|档案|真相|线索|观察)/.test(input);
-  const mentionsTrust = /(相信|合作|一起|帮你|跟你走)/.test(input);
-  const mentionsForce = /(打|威胁|抢|逼|闯)/.test(input);
-  const mentionsOutfitChange = /(换装|更衣|换上|披上|穿上|摘下|伪装|打扮|衣裳|衣服|官服|常服|礼服|斗篷)/.test(
-    input
-  );
-  const currentNpc = snapshot.storyState.characterState.npcs[sceneCounter % snapshot.storyState.characterState.npcs.length];
-
-  let beat = "会面拉开序幕";
-  let sceneGoal = "判断眼前信息的可信度。";
-  let objective = "从交谈中拿到能验证的线索。";
-  let activeThreads = [...snapshot.storyState.plotState.activeThreads];
-  let dangerLevel = "低";
-  let worldShouldUpdate = false;
-  let characterShouldUpdate = false;
-  let worldReason = "本回合主要是气氛和信息交换，没有新的长期世界事实落地。";
-  let characterReason = "本回合没有角色关系或状态上的持久变化。";
-
-  if (mentionsInquiry) {
-    beat = "玩家主动调查，让隐藏线索前置浮现";
-    sceneGoal = "让一条可验证的新线索浮出水面。";
-    objective = "顺着新线索找到第一处异常现场。";
-    activeThreads = [...activeThreads, "线索是否指向档案馆内部人员？"];
-    worldShouldUpdate = true;
-    worldReason = "新的外部异常被确认，需要写入世界事实与环境动向。";
-  } else if (mentionsTrust) {
-    beat = "玩家主动建立合作，角色关系开始绑定";
-    sceneGoal = "让盟友愿意透露更多。";
-    objective = "通过合作换来更核心的情报。";
-    dangerLevel = "中";
-    characterShouldUpdate = true;
-    characterReason = "玩家表达了合作意愿，NPC 的信任与关系需要更新。";
-  } else if (mentionsForce) {
-    beat = "玩家的强硬举动打乱平衡";
-    sceneGoal = "在后果失控前稳住局面。";
-    objective = "处理你制造出的压力和反噬。";
-    dangerLevel = "高";
-    worldShouldUpdate = true;
-    characterShouldUpdate = true;
-    worldReason = "玩家的强硬动作会改变外部风险和势力关注度。";
-    characterReason = "当前 NPC 会因你的强硬行为调整态度和信任。";
-  }
-
-  if (mentionsOutfitChange) {
-    if (!mentionsInquiry && !mentionsTrust && !mentionsForce) {
-      beat = "玩家主动调整外在形象";
-      sceneGoal = "让新的装束与身份策略在当前场景生效。";
-      objective = "用更新后的形象继续接近线索与目标人物。";
-    }
-    characterShouldUpdate = true;
-    characterReason =
-      mentionsTrust || mentionsForce
-        ? `${characterReason} 同时还要更新装扮记录。`
-        : "玩家或角色的装扮发生变化，需要更新外貌与装扮记录。";
-  }
-
-  return {
-    summary: beat,
-    review: {
-      consistency: "ok",
-      warnings: mentionsForce ? ["强硬行动会迅速拉高世界风险。"] : [],
-      canonCheck: "输入可以自然并入当前主线。",
-    },
-    plan: {
-      sceneGoal,
-      beat,
-      worldNeeds: worldShouldUpdate
-        ? [mentionsInquiry ? "揭示一条与档案馆有关的外部异常" : "记录玩家动作引发的外部风险上升"]
-        : [],
-      characterNeeds: characterShouldUpdate
-        ? [mentionsTrust ? "提升一位 NPC 的信任" : "记录当前 NPC 的防备与关系变化"]
-        : [],
-      stateMutationHints: {
-        world: {
-          shouldUpdate: worldShouldUpdate,
-          reason: worldReason,
-          scope: worldShouldUpdate ? "世界事实、外部风险或势力动向" : "无",
-        },
-        character: {
-          shouldUpdate: characterShouldUpdate,
-          reason: characterReason,
-          scope: characterShouldUpdate ? "角色信任、关系与当前状态" : "无",
-        },
-      },
-      choiceBlueprints: normalizeChoices([
-        { label: "继续追问细节", intent: "深挖信息", payload: "把你知道的细节全部说清楚。" },
-        { label: "先观察周围环境", intent: "保持谨慎", payload: "我先看看周围有没有异常。" },
-        { label: `把话题转向${currentNpc.name}`, intent: "切换关注对象", payload: `我想知道${currentNpc.name}在这件事里的位置。` },
-      ]),
-      inputHint: "继续输入对白、判断或行动",
-    },
-    stateUpdates: {
-      currentObjective: objective,
-      activeThreads: activeThreads.slice(-5),
-      dangerLevel,
-    },
-    draft: [
-      `系统旁白：你的回应落下之后，四周的空气像被一根无形的线猛地绷紧了。${sceneGoal}连廊尽头的灯火被夜风吹得忽明忽暗，连地砖上潮气都像在悄悄挪动位置。`,
-      `系统旁白：你没有立刻再开口，只让视线顺着眼前人的肩侧滑向更深的阴影处。那里安静得过分，像是藏着比这场对话本身更早抵达的秘密。`,
-      `${currentNpc.name}：${buildNpcLine(currentNpc.name, playerInput, dangerLevel)}`,
-      `系统旁白：${currentNpc.name}说话时并没有真正看向你，像是连一个多余的眼神都可能暴露立场。可正因为如此，那些被刻意压低的字句反而显得更真，也更危险。`,
-      dangerLevel === "高"
-        ? "系统旁白：远处忽然传来一阵急促而不成节奏的脚步声，像有人在黑暗里临时改变了方向。那动静不大，却足够让你意识到，自己刚才的举动已经把更多目光牵到了这里。"
-        : "系统旁白：周围的细节开始一点点松动，风穿过栏杆缝隙时带出细碎回响，像整座场景都在屏息，等你做出下一次判断。",
-    ].join("\n"),
-  };
+2. 只有你负责可见正文的连贯、节奏、文气；world/character agent 只会记录隐藏状态，不能替你写剧情。
+3. draft 要写出互动小说感，不要只给简报句。
+4. draft 写 4 到 6 段；叙述段落不要硬加前缀，只有人物开口时才用「角色名：台词」。
+5. 本回合要明确说明 plotProgress 是否推动了主线节点。
+6. choiceBlueprints 和 inputHint 继续输出，用于主 agent 推进下一步。`;
 }
 
 function normalizeNeedList(items) {
@@ -1598,11 +1228,12 @@ function decideStateAgentCalls(plotResult) {
 }
 
 function buildWorldUpdatePrompt(snapshot, plotResult, playerInput) {
-  return `你是世界控制 agent。根据本回合剧情计划和玩家行动，更新世界事实。
+  return `你是世界控制 agent。你只负责隐藏状态。根据本回合剧情计划和玩家行动，更新世界事实。
 
 玩家输入：${playerInput}
 剧情计划：${JSON.stringify(plotResult.plan)}
-当前世界摘要：${snapshot.storyState.worldState.summary}
+当前世界状态：
+${buildWorldStateDigest(snapshot.storyState.worldState)}
 
 只输出 JSON：
 {
@@ -1612,29 +1243,15 @@ function buildWorldUpdatePrompt(snapshot, plotResult, playerInput) {
     "locations": ["需要强调的地点变化"],
     "activeForces": ["势力动向"]
   }
-}`;
 }
 
-function worldUpdateMock(snapshot, plotResult) {
-  const recentEvents = [...snapshot.storyState.worldState.recentEvents];
-  recentEvents.push(plotResult.plan.sceneGoal);
-  return {
-    summary: `${snapshot.storyState.worldState.summary} 今晚的城市节奏开始加快，新的异常正在逼近表面。`,
-    delta: {
-      recentEvents: recentEvents.slice(-4),
-      locations: snapshot.storyState.worldState.locations.slice(0, 3),
-      activeForces: [
-        ...snapshot.storyState.worldState.activeForces.slice(0, 2),
-        plotResult.stateUpdates.dangerLevel === "高"
-          ? "更多眼线开始注意玩家的行动。"
-          : "暗中的观察还在继续，但尚未公开撕裂。",
-      ].slice(-3),
-    },
-  };
+要求：
+1. 这是隐藏状态，不要写剧情正文、对白或气氛描写。
+2. 只记录会影响后续写作的一致性事实。`;
 }
 
 function buildCharacterUpdatePrompt(snapshot, plotResult, playerInput) {
-  return `你是角色控制 agent。根据本回合剧情计划和玩家输入，更新角色状态。
+  return `你是角色控制 agent。你只负责隐藏状态。根据本回合剧情计划和玩家输入，更新角色状态。
 
 玩家输入：${playerInput}
 剧情计划：
@@ -1642,6 +1259,8 @@ ${buildPlanDigest(plotResult.plan)}
 当前角色摘要：${snapshot.storyState.characterState.summary || ""}
 当前角色结构：
 ${buildCharacterUpdateDigest(snapshot.storyState.characterState)}
+当前主线骨架：
+${buildPlotStateDigest(snapshot.storyState.plotState, snapshot.storyState.currentObjective)}
 
 只输出 JSON：
 {
@@ -1670,73 +1289,8 @@ ${buildCharacterUpdateDigest(snapshot.storyState.characterState)}
 1. 角色 agent 负责维护外貌与装扮记录。
 2. 外貌通常稳定，除非剧情明确改变。
 3. 装扮变化要同步写入当前 outfit 和 outfitHistory。
-4. 不要输出 markdown 代码块，不要解释，只返回 JSON。`;
-}
-
-function characterUpdateMock(snapshot, plotResult, playerInput) {
-  const mentionsTrust = /(相信|合作|一起|帮你|跟你走)/.test(playerInput);
-  const mentionsForce = /(打|威胁|抢|逼|闯)/.test(playerInput);
-  const mentionsOutfitChange = /(换装|更衣|换上|披上|穿上|摘下|伪装|打扮|衣裳|衣服|官服|常服|礼服|斗篷)/.test(
-    playerInput
-  );
-  const leadNpc = snapshot.storyState.characterState.npcs[0];
-  const trustShift = mentionsTrust ? 1 : mentionsForce ? -1 : 0;
-  const playerProfile = snapshot.storyState.characterState.playerProfile || {};
-  const nextOutfit = mentionsOutfitChange
-    ? "换上更便于隐藏身份的低调伪装，层次更轻，细节被刻意收敛。"
-    : playerProfile.outfit;
-  const nextOutfitHistory = mentionsOutfitChange
-    ? [...(playerProfile.outfitHistory || []), `本回合后改成：${nextOutfit}`].slice(-6)
-    : playerProfile.outfitHistory || [];
-
-  return {
-    summary: mentionsOutfitChange
-      ? `角色关系与装扮记录都发生了变化，新的外观线索需要持续记住。`
-      : `人物关系开始围绕玩家的表达方式产生轻微偏移。`,
-    delta: {
-      playerProfile: mentionsOutfitChange
-        ? {
-            outfit: nextOutfit,
-            outfitHistory: nextOutfitHistory,
-          }
-        : {},
-      npcs: snapshot.storyState.characterState.npcs.map((npc, index) => ({
-        id: npc.id,
-        status:
-          index === 0
-            ? trustShift > 0
-              ? "试着向玩家交出更多情报"
-              : trustShift < 0
-              ? "变得防备并准备抽身"
-              : "继续观察玩家是否值得信任"
-            : npc.status,
-        trust: index === 0 ? npc.trust + trustShift : npc.trust,
-      })),
-      relationships: [
-        ...snapshot.storyState.characterState.relationships.slice(-2),
-        mentionsOutfitChange
-          ? `玩家更换了更低调的装束，角色们对其意图的判断会随之变化。`
-          : trustShift > 0
-          ? `${leadNpc.name}对玩家的戒备略微下降。`
-          : trustShift < 0
-          ? `${leadNpc.name}开始重新评估玩家是否可靠。`
-          : `${leadNpc.name}仍未完全亮明立场。`,
-      ].slice(-4),
-    },
-  };
-}
-
-function buildNpcLine(name, playerInput, dangerLevel) {
-  if (dangerLevel === "高") {
-    return `${name}盯着你，声音压得很低：“你最好知道自己在做什么。再快一步，我们就都会被看见。”`;
-  }
-  if (/(查|问|调查|档案|真相|线索|观察)/.test(playerInput)) {
-    return `${name}把视线往旁边一偏：“你要的不是答案，是入口。旧城区档案馆今晚有人提前清场，这事不正常。”`;
-  }
-  if (/(相信|合作|一起|帮你|跟你走)/.test(playerInput)) {
-    return `${name}短暂沉默后点了点头：“好，那我先交一半。剩下的一半，要看你能不能活着走到下一站。”`;
-  }
-  return `${name}轻轻敲了敲桌面：“别急着站队。先证明你能分辨谁在撒谎。”`;
+4. 这是隐藏状态，不要写剧情正文、对白或气氛描写。
+5. 不要输出 markdown 代码块，不要解释，只返回 JSON。`;
 }
 
 function buildSkippedWorldResult(snapshot, decision) {
@@ -1832,6 +1386,44 @@ function mergeCharacterState(currentState, characterUpdate) {
   };
 }
 
+function mergePlotNodes(currentNodes, updates = []) {
+  const baseNodes = normalizePlotNodes(currentNodes);
+  const updateMap = new Map(
+    (Array.isArray(updates) ? updates : [])
+      .filter((item) => item?.id)
+      .map((item) => [item.id, item])
+  );
+
+  const merged = baseNodes.map((node) => {
+    const update = updateMap.get(node.id);
+    return update
+      ? {
+          ...node,
+          title: update.title || node.title,
+          summary: truncateInlineText(update.summary || node.summary, 120),
+          goal: truncateInlineText(update.goal || node.goal, 90),
+          status: update.status || node.status,
+        }
+      : node;
+  });
+
+  updateMap.forEach((update, id) => {
+    if (merged.some((node) => node.id === id)) {
+      return;
+    }
+
+    merged.push({
+      id,
+      title: update.title || id,
+      summary: truncateInlineText(update.summary || "", 120),
+      goal: truncateInlineText(update.goal || "", 90),
+      status: update.status || "planned",
+    });
+  });
+
+  return merged;
+}
+
 function recordPipeline(snapshot, stage, details) {
   snapshot.diagnostics.pipeline = [
     {
@@ -1878,6 +1470,14 @@ function snapshotText(snapshot) {
     })),
     plot: {
       beat: snapshot.storyState.plotState.currentBeat,
+      currentNodeId: snapshot.storyState.plotState.currentNodeId,
+      nodes: normalizePlotNodes(snapshot.storyState.plotState.nodes).map((node) => ({
+        id: node.id,
+        title: node.title,
+        status: node.status,
+      })),
+      activeThreads: snapshot.storyState.plotState.activeThreads,
+      resolvedThreads: snapshot.storyState.plotState.resolvedThreads,
       dangerLevel: snapshot.storyState.plotState.dangerLevel,
       sceneCounter: snapshot.storyState.plotState.sceneCounter,
     },
@@ -1904,8 +1504,11 @@ async function startNewGame(snapshot) {
       summary: "",
       premise: "",
       currentBeat: "建档开始",
+      currentNodeId: "",
+      nodes: [],
       milestones: [],
       activeThreads: [],
+      resolvedThreads: [],
       dangerLevel: "低",
       sceneCounter: 0,
     },
@@ -1936,13 +1539,6 @@ async function startNewGame(snapshot) {
   snapshot.chatTranscript = [];
   snapshot.diagnostics.error = null;
   recordPipeline(snapshot, "master", "新游戏开始，准备进入剧情建档。");
-  appendMessages(snapshot, [
-    {
-      type: "system",
-      speakerName: "系统旁白",
-      text: "主 agent 已接管流程。接下来会先由剧情 agent 逐步问你几个问题，确认这段故事的底色。",
-    },
-  ]);
   await continueSetup(snapshot, "");
   installTestingHooks(snapshot);
   return snapshot;
@@ -1964,7 +1560,6 @@ async function continueSetup(snapshot, playerInput) {
     memory: plotMemory,
     rolePrompt: "你是剧情控制 agent 的建档顾问。主 agent 只给你本轮要补的字段，你负责根据当前已知信息动态追问，并生成本轮选项。",
     userPrompt: buildPlotSetupPrompt(snapshot, playerInput, nextField),
-    mock: async () => plotSetupMock(snapshot, playerInput, nextField),
   });
 
   snapshot.storyState.setup.pendingField = nextField.key;
@@ -1972,7 +1567,7 @@ async function continueSetup(snapshot, playerInput) {
     snapshot.storyState.setup.askedFields.push(nextField.key);
   }
 
-  const ackText = setupResult.ack || buildFallbackSetupAck(playerInput);
+  const ackText = typeof setupResult.ack === "string" ? setupResult.ack.trim() : "";
   if (ackText) {
     appendMessages(snapshot, [
       {
@@ -1985,17 +1580,11 @@ async function continueSetup(snapshot, playerInput) {
 
   snapshot.storyState.currentObjective = "继续补全世界观、剧情和角色偏好。";
   snapshot.storyState.pendingChoices = normalizeChoices(setupResult.choices);
-  if (!snapshot.storyState.pendingChoices.length) {
-    snapshot.storyState.pendingChoices = buildDynamicSetupChoices(nextField, snapshot.storyState);
-  }
   appendMessages(snapshot, [
     {
       type: "system",
       speakerName: "系统旁白",
-      text:
-        setupResult.question?.text ||
-        setupResult.question ||
-        buildDynamicSetupQuestion(nextField, snapshot.storyState),
+      text: getSetupQuestionText(setupResult),
     },
   ]);
   recordPipeline(snapshot, "plot.setup", setupResult.summary || `建档继续收集 ${nextField.label}`);
@@ -2008,22 +1597,14 @@ async function finalizeSetup(snapshot, setupDigest) {
   snapshot.storyState.setup.ready = true;
   snapshot.storyState.setup.pendingField = null;
   snapshot.storyState.pendingChoices = [];
-  appendMessages(snapshot, [
-    {
-      type: "system",
-      speakerName: "系统旁白",
-      text: "信息已经足够，我来把世界、角色和主线搭起来。",
-    },
-  ]);
   recordPipeline(snapshot, "plot.setup", "建档完成，开始生成世界、角色和主线。");
 
   const worldResult = await callStructuredAgent({
     agentId: "world.bootstrap",
     config: providerConfig,
     memory: agentMemories.world,
-    rolePrompt: "你是世界控制 agent，负责输出精炼但可持续的世界设定。",
+    rolePrompt: "你是世界控制 agent，只负责隐藏世界状态，负责输出精炼但可持续的世界设定。",
     userPrompt: buildWorldPrompt(snapshot, setupDigest),
-    mock: async () => worldMock(snapshot, setupDigest),
   });
   snapshot.storyState.worldState = {
     ...snapshot.storyState.worldState,
@@ -2035,9 +1616,8 @@ async function finalizeSetup(snapshot, setupDigest) {
     agentId: "character.bootstrap",
     config: providerConfig,
     memory: agentMemories.character,
-    rolePrompt: "你是角色控制 agent，负责维护角色和关系的一致性。",
+    rolePrompt: "你是角色控制 agent，只负责隐藏角色状态，负责维护角色和关系的一致性。",
     userPrompt: buildCharacterPrompt(snapshot),
-    mock: async () => characterMock(snapshot),
   });
   snapshot.storyState.characterState = {
     ...snapshot.storyState.characterState,
@@ -2049,10 +1629,13 @@ async function finalizeSetup(snapshot, setupDigest) {
     agentId: "plot.bootstrap",
     config: providerConfig,
     memory: plotMemory,
-    rolePrompt: "你是剧情控制 agent，负责建立主线、关键节点，并直接写出开场草稿。",
+    rolePrompt: "你是剧情控制 agent，也是唯一负责可见正文的写作者。你负责建立主线、关键节点，并直接写出开场草稿。",
     userPrompt: buildPlotBlueprintPrompt(snapshot),
-    mock: async () => plotBlueprintMock(snapshot),
   });
+  const plotNodes = normalizePlotNodes(plotBlueprint.storyNodes);
+  const openingDraft = getRequiredDraftText(plotBlueprint.openingDraft, "plot.bootstrap");
+  const openingChoices = normalizeChoices(plotBlueprint.openingChoices);
+
   snapshot.storyState.phase = "play";
   snapshot.storyState.title = plotBlueprint.title || "未命名故事";
   snapshot.storyState.chapterId = "chapter-1";
@@ -2063,17 +1646,14 @@ async function finalizeSetup(snapshot, setupDigest) {
     premise: plotBlueprint.premise,
     summary: plotBlueprint.summary,
     currentBeat: plotBlueprint.currentBeat,
+    currentNodeId: plotBlueprint.currentNodeId || plotNodes[0]?.id || "",
+    nodes: plotNodes,
     milestones: plotBlueprint.milestones || [],
     activeThreads: plotBlueprint.activeThreads || [],
+    resolvedThreads: [],
     sceneCounter: 0,
   };
   updateCanon(plotMemory, plotBlueprint.summary);
-  const openingFallback = plotBlueprintMock(snapshot);
-  const openingDraft = plotBlueprint.openingDraft || openingFallback.openingDraft;
-  const openingChoices =
-    Array.isArray(plotBlueprint.openingChoices) && plotBlueprint.openingChoices.length
-      ? plotBlueprint.openingChoices
-      : openingFallback.openingChoices;
 
   const formatOpening = runLocalFormatAgent(
     agentMemories.format,
@@ -2084,7 +1664,7 @@ async function finalizeSetup(snapshot, setupDigest) {
   );
 
   appendMessages(snapshot, formatOpening.messages || []);
-  snapshot.storyState.pendingChoices = normalizeChoices(openingChoices);
+  snapshot.storyState.pendingChoices = openingChoices;
   snapshot.storyState.lastTurnSummary = formatOpening.summary || "故事开始";
   recordPipeline(snapshot, "format.opening", formatOpening.summary || "完成开场格式整理。");
   installTestingHooks(snapshot);
@@ -2144,11 +1724,13 @@ async function submitPlayerTurn(snapshot, rawInput, options = {}) {
     agentId: "plot.turn",
     config: providerConfig,
     memory: agentMemories.plot,
-    rolePrompt: "你是剧情控制 agent，先审查，再规划并直接写出本回合剧情草稿。",
+    rolePrompt: "你是剧情控制 agent，也是唯一负责可见正文的写作者。你先审查，再规划并直接写出本回合剧情草稿。",
     userPrompt: buildPlotTurnPrompt(snapshot, playerInput),
-    mock: async () => plotTurnMock(snapshot, playerInput),
   });
   recordPipeline(snapshot, "plot.turn", plotResult.summary || "剧情规划完成。");
+  const plotPlan = plotResult.plan || {};
+  const plotStateUpdates = plotResult.stateUpdates || {};
+  const plotProgress = plotResult.plotProgress || {};
 
   const stateAgentCalls = decideStateAgentCalls(plotResult);
   recordPipeline(
@@ -2164,9 +1746,8 @@ async function submitPlayerTurn(snapshot, rawInput, options = {}) {
         agentId: "world.turn",
         config: providerConfig,
         memory: agentMemories.world,
-        rolePrompt: "你是世界控制 agent，负责维护世界的一致性和后果。",
+        rolePrompt: "你是世界控制 agent，只负责隐藏世界状态，负责维护世界的一致性和后果。",
         userPrompt: buildWorldUpdatePrompt(snapshot, plotResult, playerInput),
-        mock: async () => worldUpdateMock(snapshot, plotResult),
       });
       updateCanon(agentMemories.world, worldResult.summary);
       recordPipeline(snapshot, "world.turn", worldResult.summary || stateAgentCalls.world.reason);
@@ -2188,9 +1769,8 @@ async function submitPlayerTurn(snapshot, rawInput, options = {}) {
         agentId: "character.turn",
         config: providerConfig,
         memory: agentMemories.character,
-        rolePrompt: "你是角色控制 agent，负责维护人物状态和关系变化。",
+        rolePrompt: "你是角色控制 agent，只负责隐藏角色状态，负责维护人物状态和关系变化。",
         userPrompt: buildCharacterUpdatePrompt(snapshot, plotResult, playerInput),
-        mock: async () => characterUpdateMock(snapshot, plotResult, playerInput),
       });
       updateCanon(agentMemories.character, characterResult.summary);
       recordPipeline(snapshot, "character.turn", characterResult.summary || stateAgentCalls.character.reason);
@@ -2209,15 +1789,26 @@ async function submitPlayerTurn(snapshot, rawInput, options = {}) {
     agentMemories.format,
     providerConfig,
     "format.turn",
-    plotResult.draft || `系统旁白：${plotResult.plan?.sceneGoal || plotResult.summary || "场景继续推进。"}`,
+    getRequiredDraftText(plotResult.draft, "plot.turn"),
     "剧情草稿已整理成本回合消息。"
   );
 
-  snapshot.storyState.plotState.currentBeat = plotResult.plan.beat;
-  snapshot.storyState.plotState.activeThreads = plotResult.stateUpdates.activeThreads || snapshot.storyState.plotState.activeThreads;
-  snapshot.storyState.plotState.dangerLevel = plotResult.stateUpdates.dangerLevel || snapshot.storyState.plotState.dangerLevel;
+  snapshot.storyState.plotState.currentBeat = plotPlan.beat || snapshot.storyState.plotState.currentBeat;
+  snapshot.storyState.plotState.activeThreads =
+    plotStateUpdates.activeThreads || snapshot.storyState.plotState.activeThreads;
+  snapshot.storyState.plotState.resolvedThreads =
+    plotStateUpdates.resolvedThreads || snapshot.storyState.plotState.resolvedThreads;
+  snapshot.storyState.plotState.dangerLevel =
+    plotStateUpdates.dangerLevel || snapshot.storyState.plotState.dangerLevel;
+  snapshot.storyState.plotState.currentNodeId =
+    plotProgress.currentNodeId || snapshot.storyState.plotState.currentNodeId;
+  snapshot.storyState.plotState.nodes = mergePlotNodes(
+    snapshot.storyState.plotState.nodes,
+    plotProgress.nodeStatusUpdates
+  );
   snapshot.storyState.plotState.sceneCounter += 1;
-  snapshot.storyState.currentObjective = plotResult.stateUpdates.currentObjective || snapshot.storyState.currentObjective;
+  snapshot.storyState.currentObjective =
+    plotStateUpdates.currentObjective || snapshot.storyState.currentObjective;
   if (!worldResult.skipped) {
     snapshot.storyState.worldState = {
       ...snapshot.storyState.worldState,
@@ -2230,7 +1821,7 @@ async function submitPlayerTurn(snapshot, rawInput, options = {}) {
   if (!characterResult.skipped) {
     snapshot.storyState.characterState = mergeCharacterState(snapshot.storyState.characterState, characterResult);
   }
-  snapshot.storyState.pendingChoices = normalizeChoices(plotResult.plan.choiceBlueprints);
+  snapshot.storyState.pendingChoices = normalizeChoices(plotPlan.choiceBlueprints);
   snapshot.storyState.lastTurnSummary = formatResult.summary || plotResult.summary;
   updateCanon(agentMemories.master, `当前目标：${snapshot.storyState.currentObjective}`);
   appendMessages(snapshot, formatResult.messages || []);

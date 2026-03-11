@@ -73,8 +73,6 @@ function pushCandidate(candidates, value) {
 function normalizeJsonLikeText(value) {
   return String(value || "")
     .replace(/^\uFEFF/, "")
-    .replace(/[“”]/g, '"')
-    .replace(/[‘’]/g, "'")
     .trim();
 }
 
@@ -84,6 +82,8 @@ function repairJsonLikeText(value) {
   }
 
   return value
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
     .replace(/([{,]\s*)([A-Za-z_\u4e00-\u9fa5][\w\u4e00-\u9fa5-]*)(\s*:)/g, '$1"$2"$3')
     .replace(/'/g, '"')
     .replace(/，/g, ",")

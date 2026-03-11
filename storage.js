@@ -3,13 +3,6 @@ const DEFAULT_TYPING_SPEED = 18;
 
 export const PROVIDER_PRESETS = [
   {
-    id: "mock",
-    label: "Mock Story (离线演示)",
-    baseUrl: "mock://story",
-    model: "wordbox-sim",
-    requiresKey: false,
-  },
-  {
     id: "openai",
     label: "OpenAI",
     baseUrl: "https://api.openai.com/v1",
@@ -60,12 +53,13 @@ function createEmptyMemory(agentId) {
 }
 
 export function createDefaultAppState() {
+  const defaultPreset = PROVIDER_MAP.get("openai");
   return {
     providerConfig: {
-      providerPreset: "mock",
-      baseUrl: PROVIDER_MAP.get("mock").baseUrl,
+      providerPreset: "openai",
+      baseUrl: defaultPreset.baseUrl,
       apiKey: "",
-      model: PROVIDER_MAP.get("mock").model,
+      model: defaultPreset.model,
       temperature: 0.9,
       maxContextBudget: 12000,
       stream: false,
@@ -108,8 +102,11 @@ export function createDefaultAppState() {
         premise: "",
         summary: "",
         currentBeat: "",
+        currentNodeId: "",
+        nodes: [],
         milestones: [],
         activeThreads: [],
+        resolvedThreads: [],
         dangerLevel: "低",
         sceneCounter: 0,
       },
@@ -141,12 +138,25 @@ export function getProviderPreset(presetId) {
 }
 
 export function normalizeProviderConfig(config) {
-  const preset = getProviderPreset(config.providerPreset);
+  const rawPresetId = typeof config?.providerPreset === "string" ? config.providerPreset.trim() : "";
+  const rawBaseUrl = typeof config?.baseUrl === "string" ? config.baseUrl.trim() : "";
+  const rawModel = typeof config?.model === "string" ? config.model.trim() : "";
+  const isLegacyMockConfig =
+    rawPresetId === "mock" || rawBaseUrl.startsWith("mock://") || rawModel === "wordbox-sim";
+  const normalizedPresetId = PROVIDER_MAP.has(rawPresetId)
+    ? rawPresetId
+    : isLegacyMockConfig
+    ? "openai"
+    : rawBaseUrl || rawModel
+    ? "custom"
+    : "openai";
+  const preset = getProviderPreset(normalizedPresetId);
+
   return {
-    providerPreset: config.providerPreset || "mock",
-    baseUrl: config.baseUrl || preset.baseUrl,
+    providerPreset: normalizedPresetId,
+    baseUrl: isLegacyMockConfig ? preset.baseUrl : rawBaseUrl || preset.baseUrl,
     apiKey: config.apiKey || "",
-    model: config.model || preset.model,
+    model: isLegacyMockConfig ? preset.model : rawModel || preset.model,
     temperature: Number.isFinite(Number(config.temperature))
       ? Number(config.temperature)
       : 0.9,
