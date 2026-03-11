@@ -437,6 +437,9 @@ async function callOpenAiCompatible(config, messages, options = {}) {
   const controller = new AbortController();
   const promptTokens = estimateTokens(messages);
   const maxTokens = Number.isFinite(options.maxTokens) ? Math.max(200, options.maxTokens) : 900;
+  const temperature = Number.isFinite(Number(options.temperature))
+    ? Number(options.temperature)
+    : config.temperature;
   const timeoutMs =
     Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
       ? options.timeoutMs
@@ -449,7 +452,7 @@ async function callOpenAiCompatible(config, messages, options = {}) {
       headers,
       body: JSON.stringify({
         model: config.model,
-        temperature: config.temperature,
+        temperature,
         messages,
         stream: false,
         max_tokens: maxTokens,
@@ -672,6 +675,7 @@ async function parseStructuredPayloadWithRepair({
   } catch (parseError) {
     let repairFailureMessage = "模型原始输出未能自动修复为合法 JSON。";
     let repairedRaw = "";
+    let retriedRaw = "";
 
     try {
       repairedRaw = await callOpenAiCompatible(
@@ -680,6 +684,7 @@ async function parseStructuredPayloadWithRepair({
         {
           maxTokens: Math.max(260, Math.min(requestOptions?.maxTokens || 700, 900)),
           timeoutMs: Math.min(requestOptions?.timeoutMs || 60000, 45000),
+          temperature: 0,
         }
       );
     } catch (repairCallError) {
@@ -691,6 +696,30 @@ async function parseStructuredPayloadWithRepair({
         return parseJsonPayload(repairedRaw);
       } catch (_repairError) {
         repairFailureMessage = "模型原始输出未能自动修复为合法 JSON。";
+      }
+    }
+
+    try {
+      retriedRaw = await callOpenAiCompatible(
+        config,
+        buildStrictJsonRetryMessages(agentId, rolePrompt, userPrompt, raw),
+        {
+          maxTokens: requestOptions?.maxTokens || 700,
+          timeoutMs: requestOptions?.timeoutMs || 70000,
+          temperature: Math.min(0.2, Number(config.temperature) || 0.2),
+        }
+      );
+    } catch (retryCallError) {
+      if (!repairFailureMessage.startsWith("JSON 修复请求失败")) {
+        repairFailureMessage = `${repairFailureMessage} 严格 JSON 重试失败：${retryCallError.message}`;
+      }
+    }
+
+    if (retriedRaw) {
+      try {
+        return parseJsonPayload(retriedRaw);
+      } catch (_retryParseError) {
+        repairFailureMessage = `${repairFailureMessage} 严格 JSON 重试仍未返回合法 JSON。`;
       }
     }
 
@@ -721,6 +750,31 @@ ${extractJsonContract(userPrompt)}
 ${String(rawOutput || "").slice(0, 7000)}
 
 请根据以上要求，输出严格合法的 JSON。`,
+    },
+  ];
+}
+
+function buildStrictJsonRetryMessages(agentId, rolePrompt, userPrompt, rawOutput) {
+  return [
+    {
+      role: "system",
+      content:
+        "你必须严格返回合法 JSON，且只能输出 JSON 本体。不要解释，不要前言，不要后记，不要 markdown 代码块。",
+    },
+    {
+      role: "user",
+      content: `上一次 ${agentId} 没有按要求返回合法 JSON。
+
+该 agent 的职责：
+${rolePrompt}
+
+请重新完成原任务，并且只能输出严格合法的 JSON。
+
+原始任务：
+${userPrompt}
+
+上一次的错误输出（仅供参考，勿重复）：
+${String(rawOutput || "").slice(0, 4000)}`,
     },
   ];
 }

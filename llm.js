@@ -168,6 +168,9 @@ export async function callOpenAiCompatible(config, messages, options = {}) {
   const controller = new AbortController();
   const promptTokens = estimateTokens(messages);
   const maxTokens = Number.isFinite(options.maxTokens) ? Math.max(200, options.maxTokens) : 900;
+  const temperature = Number.isFinite(Number(options.temperature))
+    ? Number(options.temperature)
+    : config.temperature;
   const timeoutMs =
     Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
       ? options.timeoutMs
@@ -180,7 +183,7 @@ export async function callOpenAiCompatible(config, messages, options = {}) {
       headers,
       body: JSON.stringify({
         model: config.model,
-        temperature: config.temperature,
+        temperature,
         messages,
         stream: false,
         max_tokens: maxTokens,
