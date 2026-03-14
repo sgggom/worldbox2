@@ -162,7 +162,6 @@ textarea {
 }
 
 .app-shell {
-  --chat-floating-inset: 0px;
   --shell-top-inset: max(18px, env(safe-area-inset-top));
   --shell-bottom-inset: max(18px, env(safe-area-inset-bottom));
   --shell-side-inset: 18px;
@@ -343,7 +342,7 @@ body[data-theme="dark"] #settingsToggle {
   position: relative;
   height: 100%;
   overflow-y: auto;
-  padding: 72px 6px calc(20px + var(--chat-floating-inset));
+  padding: 72px 6px 120px;
   display: flex;
   flex-direction: column;
   gap: 20px;
@@ -370,6 +369,56 @@ body[data-theme="dark"] #settingsToggle {
   flex-direction: column;
   gap: 4px;
   max-width: min(92%, 460px);
+}
+
+.message.animate-in {
+  animation: message-in 0.35s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes message-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.message-loading .message-bubble {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 14px 16px;
+  min-height: 42px;
+}
+
+.typing-dot {
+  width: 5px;
+  height: 5px;
+  background-color: var(--npc-speaker-color);
+  border-radius: 50%;
+  animation: typing-dot-bounce 1.4s infinite ease-in-out both;
+}
+
+.typing-dot:nth-child(1) {
+  animation-delay: -0.32s;
+}
+
+.typing-dot:nth-child(2) {
+  animation-delay: -0.16s;
+}
+
+@keyframes typing-dot-bounce {
+  0%, 80%, 100% {
+    transform: scale(0);
+    opacity: 0.4;
+  }
+  40% {
+    transform: scale(1);
+    opacity: 1;
+  }
 }
 
 .message-speaker {
@@ -711,6 +760,16 @@ body[data-theme="dark"] .composer-field {
   font-size: 11px;
   line-height: 1.5;
   color: var(--ink-faint);
+  transition: opacity 200ms ease;
+}
+
+.status-inline.is-loading {
+  animation: status-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes status-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
 }
 
 .scrim {
@@ -719,6 +778,24 @@ body[data-theme="dark"] .composer-field {
   background: var(--scrim);
   backdrop-filter: blur(10px);
   z-index: 30;
+}
+
+.scrim:not([hidden]) {
+  animation: scrim-in 0.25s ease-out both;
+}
+
+.scrim.is-closing {
+  animation: scrim-out 0.22s ease-in both;
+}
+
+@keyframes scrim-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes scrim-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
 }
 
 .drawer {
@@ -733,6 +810,37 @@ body[data-theme="dark"] .composer-field {
   border: 1px solid var(--drawer-line);
   box-shadow: 0 -24px 56px rgba(45, 28, 9, 0.18);
   z-index: 40;
+  will-change: transform, opacity;
+}
+
+.drawer:not([hidden]) {
+  animation: drawer-in 0.3s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.drawer.is-closing {
+  animation: drawer-out 0.25s cubic-bezier(0.4, 0, 0.2, 1) both;
+}
+
+@keyframes drawer-in {
+  from {
+    transform: translateY(100%);
+    opacity: 0.5;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+@keyframes drawer-out {
+  from {
+    transform: translateY(0);
+    opacity: 1;
+  }
+  to {
+    transform: translateY(100%);
+    opacity: 0.5;
+  }
 }
 
 .drawer-debug {
@@ -888,24 +996,28 @@ body[data-theme="dark"] .settings-story-card {
   display: none !important;
 }
 
-@media (max-width: 420px) {
+@media (max-width: 600px) {
   .app-shell {
-    --shell-side-inset: 14px;
-    width: calc(100vw - 14px);
-    height: calc(100dvh - 14px);
-    min-height: calc(100vh - 14px);
-    padding-left: var(--shell-side-inset);
-    padding-right: var(--shell-side-inset);
+    --shell-side-inset: 16px;
+    width: 100vw;
+    height: 100dvh;
+    min-height: 100dvh;
+    border-radius: 0;
   }
 
   #settingsToggle {
-    min-width: 98px;
-    min-height: 60px;
+    min-width: 84px;
+    min-height: 46px;
+    padding: 0 16px;
+    font-size: 15px;
+  }
+
+  #playerInput {
     font-size: 16px;
   }
 
   .message-text {
-    font-size: 14px;
+    font-size: 15px;
   }
 
   .message-player .message-text {

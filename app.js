@@ -12,6 +12,7 @@ import {
 
 let appState = loadAppState();
 let isBusy = false;
+let renderedMessageIds = new Set();
 const DEBUG_MODE = new URLSearchParams(window.location.search).get("debug") === "1";
 const THEME_STORAGE_KEY = "wordbox-theme-v3";
 const CHOICE_CLOSE_ANIMATION_MS = 180;
@@ -108,6 +109,8 @@ const refs = {
 const panelState = {
   settingsOpen: false,
   debugOpen: false,
+  settingsClosing: false,
+  debugClosing: false,
 };
 
 const choiceUiState = {
@@ -300,22 +303,14 @@ function handleChoiceToggle() {
     return;
   }
 
-  const shouldStickToBottom = isMessageListNearBottom();
   if (choiceUiState.expanded) {
-    animateChoiceBarClose().then(() => {
-      if (shouldStickToBottom) {
-        scrollToBottom();
-      }
-    });
+    animateChoiceBarClose();
     return;
   }
 
   choiceUiState.expanded = true;
   choiceUiState.hasUnseen = false;
   render();
-  if (shouldStickToBottom) {
-    scrollToBottom();
-  }
 }
 
 function handleThemeToggle() {
@@ -378,6 +373,7 @@ function render() {
   renderChoices(viewModel.pendingChoices, { suspended: narrationAnimating });
   refs.sendButton.disabled = isBusy || narrationAnimating;
   refs.playerInput.disabled = isBusy || narrationAnimating;
+  refs.statusText.classList.toggle("is-loading", isBusy);
 
   if (DEBUG_MODE) {
     refs.debugState.textContent = JSON.stringify(viewModel.debugState, null, 2);
@@ -385,9 +381,19 @@ function render() {
     refs.debugPipeline.textContent = JSON.stringify(viewModel.debugPipeline, null, 2);
   }
 
-  refs.scrim.hidden = !(panelState.settingsOpen || (DEBUG_MODE && panelState.debugOpen));
+  const anyPanelOpen = panelState.settingsOpen || (DEBUG_MODE && panelState.debugOpen);
+  const allOpenPanelsClosing = 
+    (!panelState.settingsOpen || panelState.settingsClosing) && 
+    (!(DEBUG_MODE && panelState.debugOpen) || panelState.debugClosing);
+
+  refs.scrim.hidden = !anyPanelOpen;
+  refs.scrim.classList.toggle("is-closing", anyPanelOpen && allOpenPanelsClosing);
+
   refs.settingsDrawer.hidden = !panelState.settingsOpen;
+  refs.settingsDrawer.classList.toggle("is-closing", panelState.settingsClosing);
+
   refs.debugDrawer.hidden = !DEBUG_MODE || !panelState.debugOpen;
+  refs.debugDrawer.classList.toggle("is-closing", panelState.debugClosing);
   syncFloatingTrayPosition();
 }
 
@@ -396,23 +402,43 @@ function renderMessages(messages) {
 
   const visibleMessages = messages.filter(shouldRenderMessage);
 
-  if (!visibleMessages.length) {
+  if (!visibleMessages.length && !isBusy) {
     const empty = document.createElement("p");
     empty.className = "message-empty";
     empty.textContent = "点击“设置”，保存模型后开始新游戏。";
     refs.messageList.append(empty);
+    renderedMessageIds.clear();
     return;
   }
 
+  const newRenderedIds = new Set();
   const fragment = document.createDocumentFragment();
   for (const message of visibleMessages) {
     const node = refs.messageTemplate.content.firstElementChild.cloneNode(true);
     node.classList.add(`message-${message.type}`);
+    if (message.id) {
+      if (!renderedMessageIds.has(message.id)) {
+        node.classList.add("animate-in");
+      }
+      newRenderedIds.add(message.id);
+    }
     node.querySelector(".message-speaker").textContent = message.speakerName || "";
     node.querySelector(".message-text").textContent = getDisplayedMessageText(message);
     applyMessageAccent(node, message);
     fragment.append(node);
   }
+
+  if (isBusy) {
+    const loadingNode = refs.messageTemplate.content.firstElementChild.cloneNode(true);
+    loadingNode.classList.add("message-npc", "message-loading", "animate-in");
+    loadingNode.querySelector(".message-speaker").textContent = "思考中...";
+    loadingNode.querySelector(".message-text").innerHTML = `<span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span>`;
+    // optionally give it the default accent
+    applyMessageAccent(loadingNode, { type: "npc", speakerName: "system" });
+    fragment.append(loadingNode);
+  }
+
+  renderedMessageIds = newRenderedIds;
   refs.messageList.append(fragment);
 }
 
@@ -549,14 +575,39 @@ function renderChoices(choices, options = {}) {
   });
 }
 
-function togglePanel(panel, open) {
-  if (panel === "settings") {
-    panelState.settingsOpen = open;
+async function togglePanel(panel, open) {
+  if (open) {
+    if (panel === "settings") {
+      panelState.settingsOpen = true;
+      panelState.settingsClosing = false;
+    }
+    if (panel === "debug" && DEBUG_MODE) {
+      panelState.debugOpen = true;
+      panelState.debugClosing = false;
+    }
+    render();
+  } else {
+    if (panel === "settings" && panelState.settingsOpen && !panelState.settingsClosing) {
+      panelState.settingsClosing = true;
+      render();
+      await wait(260);
+      if (panelState.settingsClosing) {
+        panelState.settingsOpen = false;
+        panelState.settingsClosing = false;
+        render();
+      }
+    }
+    if (panel === "debug" && panelState.debugOpen && !panelState.debugClosing) {
+      panelState.debugClosing = true;
+      render();
+      await wait(260);
+      if (panelState.debugClosing) {
+        panelState.debugOpen = false;
+        panelState.debugClosing = false;
+        render();
+      }
+    }
   }
-  if (panel === "debug" && DEBUG_MODE) {
-    panelState.debugOpen = open;
-  }
-  render();
 }
 
 function consumePendingChoices() {
@@ -877,19 +928,12 @@ function syncFloatingTrayPosition() {
   }
 
   if (!refs.choiceTray || refs.choiceTray.hidden) {
-    refs.appShell.style.setProperty("--chat-floating-inset", "0px");
     refs.appShell.classList.remove("has-choice-overlay");
     return;
   }
 
   const composerHeight = refs.composer?.offsetHeight || 0;
-  const toggleHeight = refs.choiceToggle?.offsetHeight || 44;
-  const panelHeight =
-    !refs.choiceBar || refs.choiceBar.hidden ? 0 : refs.choiceBar.offsetHeight + 12;
-  const reserveInset = Math.max(88, toggleHeight + panelHeight + 40);
-
   refs.choiceTray.style.bottom = `${composerHeight + 36}px`;
-  refs.appShell.style.setProperty("--chat-floating-inset", `${reserveInset}px`);
 }
 
 function escapeHtml(text) {

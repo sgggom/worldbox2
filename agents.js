@@ -46,7 +46,16 @@ function normalizeChoices(choices = []) {
     .filter(Boolean)
     .slice(0, 4)
     .map((choice, index) => {
-      const label = choice.label || choice.title || choice.text || "";
+      let label = choice.label || choice.title || choice.text || "";
+      let intent = choice.intent || "";
+
+      // 如果 label 看上去是程序 key（如 check_map），而 intent 是正经中文描述，
+      // 则把 intent 提升为 label 展示给玩家
+      if (label && intent && looksLikeProgrammaticKey(label) && !looksLikeProgrammaticKey(intent)) {
+        label = intent;
+        intent = "";
+      }
+
       if (!label) {
         return null;
       }
@@ -54,11 +63,18 @@ function normalizeChoices(choices = []) {
       return {
         id: choice.id || `choice-${index + 1}`,
         label,
-        intent: choice.intent || "",
-        payload: choice.payload || label,
+        intent,
+        payload: String(choice.payload || label || ""),
       };
     })
     .filter(Boolean);
+}
+
+function looksLikeProgrammaticKey(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return true;
+  // Match patterns like: check_map, askSpecifics, final-check, SOME_KEY
+  return /^[a-zA-Z][a-zA-Z0-9_\-]*$/.test(trimmed) && trimmed.length < 40;
 }
 
 function createTurnRecord(summary, payload) {
@@ -467,37 +483,228 @@ function runLocalFormatAgent(memory, config, agentId, draft, summary) {
 }
 
 function parseDraftMessages(draft) {
-  return String(draft || "")
+  const rawLines = String(draft || "")
     .split(/\n+/)
     .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const delimiterIndex = line.includes("：") ? line.indexOf("：") : line.indexOf(":");
-      if (delimiterIndex < 0) {
-        return {
-          type: "system",
-          speakerName: "系统旁白",
-          text: line,
-        };
-      }
+    .filter(Boolean);
 
+  const fragments = [];
+
+  for (const line of rawLines) {
+    // 1. Try explicit "角色名：台词" prefix format first
+    const delimiterIndex = line.includes("：") ? line.indexOf("：") : line.indexOf(":");
+    if (delimiterIndex > 0) {
       const speaker = line.slice(0, delimiterIndex).trim();
       const text = line.slice(delimiterIndex + 1).trim();
       const looksLikeSpeaker = /^(系统旁白|旁白|系统|[\u4e00-\u9fa5A-Za-z0-9·]{1,16})$/.test(speaker);
-      if (!looksLikeSpeaker) {
-        return {
+      if (looksLikeSpeaker) {
+        const isSystem = /^(系统旁白|旁白|系统)$/.test(speaker);
+        fragments.push({
+          type: isSystem ? "system" : "npc",
+          speakerName: isSystem ? "系统旁白" : speaker || "角色",
+          text: text || line,
+        });
+        continue;
+      }
+    }
+
+    // 2. Try to split inline dialogue embedded in prose
+    //    Detect patterns like: 「台词」, 「台词，」角色名说/补充道/...
+    const inlineFragments = splitInlineDialogue(line);
+    if (inlineFragments.length > 1) {
+      fragments.push(...inlineFragments);
+      continue;
+    }
+
+    // 3. Fallback: treat as system narration
+    fragments.push({
+      type: "system",
+      speakerName: "系统旁白",
+      text: line,
+    });
+  }
+
+  // Merge consecutive system fragments into single bubbles
+  return mergeConsecutiveSystem(fragments);
+}
+
+function splitInlineDialogue(line) {
+  // Regex to find 「...」 blocks (including nested 『』 and '...')
+  const quoteRegex = /「([^」]*(?:『[^』]*』[^」]*)*)」/g;
+  const quotes = [];
+  let match;
+  while ((match = quoteRegex.exec(line)) !== null) {
+    quotes.push({
+      start: match.index,
+      end: match.index + match[0].length,
+      text: match[1],
+      fullMatch: match[0],
+    });
+  }
+
+  if (quotes.length === 0) {
+    return [{ type: "system", speakerName: "系统旁白", text: line }];
+  }
+
+  // Speaker name: 2-8 Chinese chars (or mixed with ·), common for fiction names
+  const nameRe = /[\u4e00-\u9fa5A-Za-z·]{2,8}/;
+
+  // Speech verbs — expanded list covering modern Chinese fiction
+  const verbRe = /(?:说|道|喊|叫|问|答|笑|哼|吼|嚷|嘀咕|咕哝|嘟囔|呢喃|喃喃|嘶声|冷哼|轻哼|闷哼|低吼|怒吼|咬牙|开口|出声|接口|接话|插嘴|回应|应声|回答|应道|回道|续道|继续|补充|提醒|催促|警告|追问|反问|发话|说道|问道|答道|喊道|叫道|笑道|怒道|吼道|哼道|嚷道|低声道|冷声道|淡淡道|轻声道|补充道|沉声道|嘶声道|咬牙道|平静道|缓缓道|慢慢道|急促道|不屑道|不悦道|低声说|轻声说|冷冷说|慢慢说|急忙说|赶紧说|连忙说|大声说|沉声说|淡淡说|低声问|轻声问|追问道|反问道)/;
+
+  // A broader pattern to match speaker + any action before speech
+  // e.g. "拉尔斯哼了一口" or "拉尔斯显然是注意到了，眼睛眯起来"
+  const verbLooseRe = /(?:说|道|喊|叫|问|答|笑|哼|吼|嚷|嘀咕|咕哝|嘟囔|呢喃|喃喃|开口|出声|接口|接话|插嘴|回应|补充|提醒|催促|追问|反问|发话)/;
+
+  const fragments = [];
+  let cursor = 0;
+  let lastSpeaker = "";
+
+  for (let i = 0; i < quotes.length; i++) {
+    const q = quotes[i];
+    const beforeText = line.slice(cursor, q.start).trim();
+    const afterStart = q.end;
+    const nextQuoteStart = i + 1 < quotes.length ? quotes[i + 1].start : line.length;
+    const afterText = line.slice(afterStart, nextQuoteStart).trim();
+
+    let speaker = "";
+    let cleanBeforeText = beforeText;
+
+    if (beforeText) {
+      // Pattern A: ...角色名说「...」 — direct speech verb before quote
+      const directMatch = beforeText.match(
+        new RegExp(`(${nameRe.source})(?:${verbRe.source})[^「]*$`)
+      );
+      if (directMatch) {
+        speaker = directMatch[1];
+        cleanBeforeText = beforeText.slice(0, directMatch.index).trim();
+      }
+
+      // Pattern B: ...角色名verb了...,「...」 — verb with extra action text
+      if (!speaker) {
+        const looseMatch = beforeText.match(
+          new RegExp(`(${nameRe.source})[^，。；！？「」]{0,6}(?:${verbLooseRe.source})[^「]*$`)
+        );
+        if (looseMatch) {
+          speaker = looseMatch[1];
+          cleanBeforeText = beforeText.slice(0, looseMatch.index).trim();
+        }
+      }
+
+      // Pattern C: ...角色名...：「...」 — colon before quote (dialogue attribution)
+      if (!speaker && beforeText.endsWith("：")) {
+        const colonText = beforeText.slice(0, -1).trim();
+        // Find the last CJK name in the text before colon
+        const colonNameMatch = colonText.match(
+          new RegExp(`(${nameRe.source})[^，。；！？「」]{0,20}$`)
+        );
+        if (colonNameMatch) {
+          speaker = colonNameMatch[1];
+          // Keep the narration before the speaker name
+          cleanBeforeText = colonText.slice(0, colonNameMatch.index).trim();
+        }
+      }
+    }
+
+    // Pattern D: 「...」角色名verb — after-quote attribution
+    if (!speaker && afterText) {
+      const afterMatch = afterText.match(
+        new RegExp(`^\\s*(${nameRe.source})(?:${verbRe.source})`)
+      );
+      if (afterMatch) {
+        speaker = afterMatch[1];
+      }
+    }
+
+    // Pattern E: carry forward last known speaker if quotes are consecutive
+    // (no narration between them, or only a short action like "，")
+    if (!speaker && lastSpeaker) {
+      const gapText = beforeText.replace(/[，、。；…！？\s]/g, "");
+      if (gapText.length <= 12) {
+        speaker = lastSpeaker;
+        // Short action text between quotes stays as narration if non-trivial
+        if (gapText.length > 0) {
+          // keep cleanBeforeText as-is
+        } else {
+          cleanBeforeText = "";
+        }
+      }
+    }
+
+    // Add narration before quote if any
+    if (cleanBeforeText) {
+      fragments.push({
+        type: "system",
+        speakerName: "系统旁白",
+        text: cleanBeforeText,
+      });
+    }
+
+    // Add the dialogue
+    if (q.text.trim()) {
+      if (speaker) {
+        fragments.push({
+          type: "npc",
+          speakerName: speaker,
+          text: `「${q.text}」`,
+        });
+        lastSpeaker = speaker;
+      } else {
+        fragments.push({
           type: "system",
           speakerName: "系统旁白",
-          text: line,
-        };
+          text: `「${q.text}」`,
+        });
       }
-      const isSystem = /^(系统旁白|旁白|系统)$/.test(speaker);
-      return {
-        type: isSystem ? "system" : "npc",
-        speakerName: isSystem ? "系统旁白" : speaker || "角色",
-        text: text || line,
-      };
-    });
+    }
+
+    cursor = q.end;
+  }
+
+  // Trailing text after last quote
+  const trailingText = line.slice(cursor).trim();
+  if (trailingText) {
+    // Check if it's pure attribution like "角色名说。"
+    const pureAttribution = trailingText.match(
+      new RegExp(`^(${nameRe.source})(?:${verbRe.source})[^\\u4e00-\\u9fa5]*$`)
+    );
+    if (pureAttribution && fragments.length > 0) {
+      const lastFrag = fragments[fragments.length - 1];
+      if (lastFrag.speakerName === "系统旁白" && lastFrag.text.startsWith("「")) {
+        lastFrag.type = "npc";
+        lastFrag.speakerName = pureAttribution[1];
+      }
+    } else {
+      fragments.push({
+        type: "system",
+        speakerName: "系统旁白",
+        text: trailingText,
+      });
+    }
+  }
+
+  if (fragments.length <= 1) {
+    return [{ type: "system", speakerName: "系统旁白", text: line }];
+  }
+
+  return fragments;
+}
+
+/**
+ * Merge consecutive system (narration) fragments into single bubbles
+ * to keep the chat view clean.
+ */
+function mergeConsecutiveSystem(fragments) {
+  const merged = [];
+  for (const frag of fragments) {
+    const prev = merged[merged.length - 1];
+    if (prev && prev.type === "system" && frag.type === "system") {
+      prev.text = prev.text + "\n" + frag.text;
+    } else {
+      merged.push({ ...frag });
+    }
+  }
+  return merged;
 }
 
 function getRequestOptionsForAgent(agentId) {
@@ -535,7 +742,7 @@ ${playerInput || "无，准备开启第一问"}
   "summary": "一句话总结当前建档进度",
   "ack": "对玩家上轮回答的简短承接",
   "question": "下一条问题，准备给格式 agent 使用",
-  "choices": [{"label":"...", "intent":"..."}],
+  "choices": [{"label":"选项显示文字（自然语言，不要用 key）", "intent":"补充说明"}],
   "field": "${targetField.key}"
 }
 
@@ -672,7 +879,7 @@ ${buildCharacterUpdateDigest(snapshot.storyState.characterState)}
   "activeThreads": ["当前悬而未决的问题"],
   "openingObjective": "玩家现在最先要做什么",
   "openingDraft": "开场正文。允许自然分段叙事；旁白段落直接写 prose，对话行才使用「角色名：台词」",
-  "openingChoices": [{"label":"...", "intent":"...", "payload":"..."}],
+  "openingChoices": [{"label":"选项显示文字（自然语言，不要用 key）", "intent":"选择这个选项的含义", "payload":"发送给系统的完整文本"}],
   "openingInputHint": "输入提示"
 }
 
@@ -728,7 +935,7 @@ ${buildTranscriptDigest(snapshot, 8)}
         "scope": "角色信任/关系/身份/伤势/去向"
       }
     },
-    "choiceBlueprints": [{"label":"...", "intent":"...", "payload":"..."}],
+    "choiceBlueprints": [{"label":"选项显示文字（自然语言，不要用 key）", "intent":"选择这个选项的含义", "payload":"发送给系统的完整文本"}],
     "inputHint": "输入提示"
   },
   "stateUpdates": {
@@ -1253,8 +1460,8 @@ function installTestingHooks(snapshot) {
 }
 
 export async function submitPlayerTurn(snapshot, rawInput, options = {}) {
-  const playerInput = (rawInput || "").trim();
-  const playerDisplayText = (options.displayText || rawInput || "").trim();
+  const playerInput = String(rawInput || "").trim();
+  const playerDisplayText = String(options.displayText || rawInput || "").trim();
   if (!playerInput) {
     throw new Error("请输入内容。");
   }
